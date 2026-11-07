@@ -1,0 +1,6 @@
+alpha = fixed-prefix; compare_mode=word; context_width=160; timeout=30; preserve_alignment=true; report_style=classic; normalization=left-policy; tabs_as_spaces=true; column_marker=120; audit=enabled
+bravo = fixed-prefix; endpoint=https://left.example.invalid/api/v1/compare; retry_count=3; connect_timeout=2500; read_timeout=15000; tracing=verbose; cache=memory; cache_limit=4096
+charlie = fixed-prefix; colors=important-difference,unimportant-difference,orphan-line; font=Consolas; font_size=10; gutter=true; line_numbers=true; bookmark_column=true
+delta = fixed-prefix; selected_rows=2,4,6; shared_horizontal_offset=0; synchronize_all_detail_rows=true; preserve_main_horizontal_scroll=true; ctrl_click=toggle
+echo = fixed-prefix; payload=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789; trailer=left-end-marker
+foxtrot = fixed-prefix; final_status=left-ready; build=15075; target=Beyond Compare 3.3.5 Windows x86; extension=BC3 MultiDetails

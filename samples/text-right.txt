@@ -1,0 +1,14 @@
+Beyond Compare 3 - Release Notes
+
+Version: 3.3.14
+Channel: preview
+Platform: Linux x86
+
+Features:
+- Compare text files side by side
+- Highlight changed words and characters
+- Save comparison sessions
+- Export a difference report
+
+Status: Review completed
+Build: 19007

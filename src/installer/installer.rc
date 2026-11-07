@@ -1,0 +1,63 @@
+#include "resource.h"
+
+#define RT_RCDATA 10
+#define RT_MANIFEST 24
+#define CREATEPROCESS_MANIFEST_RESOURCE_ID 1
+#define DS_SETFONT 0x40
+#define DS_MODALFRAME 0x80
+#define DS_FIXEDSYS 0x08
+#define WS_POPUP 0x80000000L
+#define WS_CAPTION 0x00c00000L
+#define WS_SYSMENU 0x00080000L
+#define ES_AUTOHSCROLL 0x0080L
+#define SS_LEFT 0x0000L
+#define WS_CHILD 0x40000000L
+#define WS_VISIBLE 0x10000000L
+#define IDCANCEL 2
+
+1 VERSIONINFO
+ FILEVERSION 0,1,0,0
+ PRODUCTVERSION 0,1,0,0
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0x0L
+ FILEOS 0x40004L
+ FILETYPE 0x1L
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName", "BC3 MultiDetails Project"
+            VALUE "FileDescription", "Setup for BC3 MultiDetails"
+            VALUE "FileVersion", "0.1.0.0"
+            VALUE "InternalName", "BC3MultiDetailsSetup.exe"
+            VALUE "OriginalFilename", "BC3MultiDetailsSetup.exe"
+            VALUE "ProductName", "BC3 MultiDetails"
+            VALUE "ProductVersion", "0.1.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
+
+CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "installer.manifest"
+IDR_PLUGIN_DLL RCDATA "../../dist/version.dll"
+
+IDD_INSTALLER DIALOGEX 0, 0, 330, 174
+STYLE DS_SETFONT | DS_MODALFRAME | DS_FIXEDSYS | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "BC3 MultiDetails Setup"
+FONT 9, "Segoe UI"
+BEGIN
+    LTEXT "Adds selectable multi-row Text Details to Beyond Compare 3.", -1, 14, 12, 302, 12
+    LTEXT "Supported target: Windows BC3 3.3.5 (build 15075) only.", -1, 14, 29, 302, 12
+    LTEXT "Beyond Compare 3 folder:", -1, 14, 54, 180, 10
+    EDITTEXT IDC_INSTALL_PATH, 14, 68, 252, 14, ES_AUTOHSCROLL
+    PUSHBUTTON "Browse...", IDC_BROWSE, 270, 67, 47, 16
+    LTEXT "The installer verifies BCompare.exe before making any change.", -1, 14, 91, 302, 10
+    CONTROL "", IDC_STATUS, "STATIC", SS_LEFT | WS_CHILD | WS_VISIBLE, 14, 108, 302, 25
+    DEFPUSHBUTTON "Install", IDC_INSTALL, 219, 145, 47, 17
+    PUSHBUTTON "Cancel", IDCANCEL, 270, 145, 47, 17
+END

@@ -1,0 +1,24 @@
+# Proprietary research inputs and extracted application files
+/artifacts/
+/extracted/
+
+# Local toolchains, runtime environments, and generated evidence
+/runtime/
+/evidence/
+/analysis/*.snapshot.json
+
+# Build outputs are distributed through GitHub Releases, not source control
+/build/
+/dist/
+
+# Keep only the curated documentation screenshots
+/screenshots/*
+!/screenshots/bc3-windows-multidetails-text.png
+!/screenshots/bc3-installer-ctrl-shift-regression.png
+!/screenshots/bc3-shared-horizontal-after-fixed.png
+!/screenshots/bc3-installer-final.png
+
+*.bmp
+*.xwd
+*.log
+.DS_Store

@@ -1,0 +1,14 @@
+Beyond Compare 3 - Release Notes
+
+Version: 3.3.13
+Channel: stable
+Platform: Linux x86
+
+Features:
+- Compare text files side by side
+- Highlight changed words
+- Ignore unimportant whitespace
+- Save comparison sessions
+
+Status: Ready for review
+Build: 18981
