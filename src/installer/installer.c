@@ -12,7 +12,7 @@
 #include "resource.h"
 
 #define PRODUCT_NAME L"BC3 MultiDetails"
-#define PRODUCT_VERSION L"0.1.0"
+#define PRODUCT_VERSION L"0.1.1"
 #define TARGET_EXE L"BCompare.exe"
 #define PLUGIN_NAME L"version.dll"
 #define UNINSTALLER_NAME L"BC3MultiDetailsUninstall.exe"
@@ -38,6 +38,22 @@ static const BYTE target_sha256[32] = {
     0xfc, 0x30, 0x07, 0x6d, 0x32, 0xa9, 0x57, 0x57,
     0xa2, 0xc3, 0x69, 0xcc, 0xb6, 0x4a, 0xe5, 0x45,
     0x72, 0xe9, 0xf5, 0x62, 0x28, 0x0a, 0xe8, 0x45
+};
+
+/* Exact v0.1.0 release artifacts.  These are the only pre-existing files
+   that the v0.1.1 installer is allowed to replace during an upgrade. */
+static const BYTE previous_plugin_sha256[32] = {
+    0x50, 0xda, 0x92, 0x4e, 0xe9, 0x31, 0xb3, 0xe2,
+    0x47, 0xc0, 0x13, 0xac, 0x9f, 0x9f, 0x91, 0xe5,
+    0xdc, 0x31, 0x75, 0xab, 0x35, 0x6c, 0x3a, 0x6f,
+    0x6a, 0x45, 0xea, 0x1a, 0x0b, 0x41, 0x85, 0xd8
+};
+
+static const BYTE previous_setup_sha256[32] = {
+    0x7f, 0xf0, 0x57, 0x91, 0x3e, 0xdc, 0x80, 0x54,
+    0x4f, 0x1f, 0x75, 0x30, 0x23, 0x82, 0x6b, 0xcb,
+    0xb3, 0x8d, 0xc2, 0x6e, 0x05, 0x31, 0xfd, 0x1f,
+    0xce, 0x91, 0x46, 0x74, 0x7f, 0x96, 0xb6, 0x9b
 };
 
 static HINSTANCE instance_handle;
@@ -210,6 +226,12 @@ cleanup:
     return same;
 }
 
+static BOOL file_has_sha256(const WCHAR *path, const BYTE expected[32]) {
+    BYTE digest[32];
+    return hash_file(path, digest, NULL) &&
+           memcmp(digest, expected, sizeof(digest)) == 0;
+}
+
 static BOOL write_plugin(const WCHAR *directory, WCHAR *message,
                          size_t message_capacity) {
     const void *data;
@@ -218,6 +240,7 @@ static BOOL write_plugin(const WCHAR *directory, WCHAR *message,
     WCHAR temporary[MAX_PATH];
     HANDLE file;
     DWORD written;
+    BOOL replace_existing = FALSE;
     if (!plugin_resource(&data, &size)) {
         lstrcpynW(message, L"The embedded extension payload is missing.",
                   (int)message_capacity);
@@ -226,11 +249,16 @@ static BOOL write_plugin(const WCHAR *directory, WCHAR *message,
     join_path(destination, MAX_PATH, directory, PLUGIN_NAME);
     if (file_exists(destination)) {
         if (file_matches_memory(destination, data, size)) return TRUE;
-        lstrcpynW(message,
-                  L"A different version.dll already exists beside BCompare.exe. "
-                  L"It was not overwritten.", (int)message_capacity);
-        SetLastError(ERROR_ALREADY_EXISTS);
-        return FALSE;
+        if (file_has_sha256(destination, previous_plugin_sha256)) {
+            replace_existing = TRUE;
+        } else {
+            lstrcpynW(message,
+                      L"A different version.dll already exists beside "
+                      L"BCompare.exe. It was not overwritten.",
+                      (int)message_capacity);
+            SetLastError(ERROR_ALREADY_EXISTS);
+            return FALSE;
+        }
     }
     _snwprintf(temporary, MAX_PATH, L"%ls.bc3md.%08lx.tmp", destination,
                GetCurrentProcessId());
@@ -245,7 +273,8 @@ static BOOL write_plugin(const WCHAR *directory, WCHAR *message,
         goto io_error;
     }
     CloseHandle(file);
-    if (!MoveFileExW(temporary, destination, MOVEFILE_WRITE_THROUGH)) {
+    if (!MoveFileExW(temporary, destination, MOVEFILE_WRITE_THROUGH |
+                     (replace_existing ? MOVEFILE_REPLACE_EXISTING : 0))) {
         DeleteFileW(temporary);
         goto io_error;
     }
@@ -304,13 +333,27 @@ cleanup:
 static BOOL write_uninstaller(const WCHAR *directory) {
     WCHAR source[MAX_PATH];
     WCHAR destination[MAX_PATH];
+    WCHAR temporary[MAX_PATH];
     GetModuleFileNameW(NULL, source, MAX_PATH);
     join_path(destination, MAX_PATH, directory, UNINSTALLER_NAME);
     if (same_path(source, destination)) return TRUE;
     if (file_exists(destination)) {
         if (files_equal(source, destination)) return TRUE;
-        SetLastError(ERROR_ALREADY_EXISTS);
-        return FALSE;
+        if (!file_has_sha256(destination, previous_setup_sha256)) {
+            SetLastError(ERROR_ALREADY_EXISTS);
+            return FALSE;
+        }
+        _snwprintf(temporary, MAX_PATH, L"%ls.bc3md.%08lx.tmp",
+                   destination, GetCurrentProcessId());
+        temporary[MAX_PATH - 1] = L'\0';
+        if (!CopyFileW(source, temporary, TRUE)) return FALSE;
+        if (!MoveFileExW(temporary, destination,
+                         MOVEFILE_REPLACE_EXISTING |
+                         MOVEFILE_WRITE_THROUGH)) {
+            DeleteFileW(temporary);
+            return FALSE;
+        }
+        return TRUE;
     }
     return CopyFileW(source, destination, FALSE);
 }

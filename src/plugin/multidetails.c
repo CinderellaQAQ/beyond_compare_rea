@@ -168,9 +168,12 @@ static void surface_destroy(TempSurface *surface) {
 
 static BOOL strip_create(CapturedStrip *strip, int width, int height) {
     TempSurface surface;
+    RECT rect;
     if (!surface_create(&surface, width, height)) {
         return FALSE;
     }
+    SetRect(&rect, 0, 0, width, height);
+    FillRect(surface.dc, &rect, GetSysColorBrush(COLOR_WINDOW));
     strip_destroy(strip);
     strip->bitmap = surface.bitmap;
     strip->dc = surface.dc;
@@ -286,6 +289,123 @@ static BOOL capture_editor(HWND window, TempSurface *surface) {
     return TRUE;
 }
 
+static int editor_cell_width(HWND window) {
+    HDC dc;
+    HFONT font;
+    HGDIOBJ previous = NULL;
+    SIZE size;
+    int width = 0;
+    if (!window) return 0;
+    dc = GetDC(window);
+    if (!dc) return 0;
+    font = (HFONT)SendMessageW(window, WM_GETFONT, 0, 0);
+    if (font) previous = SelectObject(dc, font);
+    if (GetTextExtentPoint32W(dc, L"M", 1, &size)) width = size.cx;
+    if (previous) SelectObject(dc, previous);
+    ReleaseDC(window, dc);
+    return width;
+}
+
+static int surface_horizontal_shift(const TempSurface *before,
+                                    const TempSurface *after,
+                                    int max_shift) {
+    const uint32_t *before_pixels;
+    const uint32_t *after_pixels;
+    int best_shift = 0;
+    int best_score = 0x7fffffff;
+    int shift;
+    if (!before->bits || !after->bits || before->width != after->width ||
+        before->height != after->height) {
+        return 0;
+    }
+    if (before->width / 2 < max_shift) {
+        max_shift = before->width / 2;
+    }
+    if (max_shift < 1) return 0;
+    before_pixels = (const uint32_t *)before->bits;
+    after_pixels = (const uint32_t *)after->bits;
+    for (shift = 1; shift <= max_shift; ++shift) {
+        int score = 0;
+        int y;
+        for (y = 0; y < before->height; ++y) {
+            int x;
+            int row = y * before->width;
+            for (x = FIXED_GUTTER_WIDTH + 2;
+                 x < before->width - max_shift; ++x) {
+                if ((before_pixels[row + x + shift] & 0x00ffffffu) !=
+                    (after_pixels[row + x] & 0x00ffffffu)) {
+                    ++score;
+                }
+            }
+        }
+        if (score < best_score) {
+            best_score = score;
+            best_shift = shift;
+        }
+    }
+    return best_shift;
+}
+
+static int measure_editor_cell_width(void *left_editor, void *right_editor,
+                                     HWND left_window, HWND right_window,
+                                     int left_max_scroll,
+                                     int right_max_scroll) {
+    void *measured_editor;
+    HWND measured_window;
+    TempSurface before;
+    TempSurface after;
+    int measured_max_scroll;
+    int column_delta;
+    int pixel_shift;
+    int old_left_x;
+    int old_right_x;
+    int width = 0;
+    if (left_max_scroll > 0) {
+        measured_editor = left_editor;
+        measured_window = left_window;
+        measured_max_scroll = left_max_scroll;
+    } else if (right_max_scroll > 0) {
+        measured_editor = right_editor;
+        measured_window = right_window;
+        measured_max_scroll = right_max_scroll;
+    } else {
+        return 0;
+    }
+    old_left_x = g_bc3.get_left_x(left_editor);
+    old_right_x = g_bc3.get_left_x(right_editor);
+    g_bc3.set_left_x(left_editor, 0);
+    g_bc3.set_left_x(right_editor, 0);
+    if (!capture_editor(measured_window, &before)) goto restore;
+    column_delta = measured_max_scroll < 16 ? measured_max_scroll : 16;
+    if (left_max_scroll > 0) {
+        g_bc3.set_left_x(left_editor,
+                         left_max_scroll < column_delta
+                             ? left_max_scroll : column_delta);
+    }
+    if (right_max_scroll > 0) {
+        g_bc3.set_left_x(right_editor,
+                         right_max_scroll < column_delta
+                             ? right_max_scroll : column_delta);
+    }
+    if (g_bc3.get_left_x(measured_editor) != column_delta ||
+        !capture_editor(measured_window, &after)) {
+        surface_destroy(&before);
+        goto restore;
+    }
+    pixel_shift = surface_horizontal_shift(&before, &after,
+                                           before.width / 2);
+    if (pixel_shift > 0) {
+        width = (pixel_shift + column_delta / 2) / column_delta;
+    }
+    surface_destroy(&before);
+    surface_destroy(&after);
+
+restore:
+    g_bc3.set_left_x(left_editor, old_left_x);
+    g_bc3.set_left_x(right_editor, old_right_x);
+    return width;
+}
+
 static BOOL capture_current_pair(ViewState *view, SelectedPair *pair) {
     void *left_editor = bc3_frame_detail_editor(view->frame, 0);
     void *right_editor = bc3_frame_detail_editor(view->frame, 1);
@@ -294,6 +414,7 @@ static BOOL capture_current_pair(ViewState *view, SelectedPair *pair) {
     RECT left_rect;
     RECT right_rect;
     int old_left_x;
+    int old_right_x;
     int left_x_count;
     int right_x_count;
     int left_max_scroll;
@@ -327,8 +448,16 @@ static BOOL capture_current_pair(ViewState *view, SelectedPair *pair) {
         visible_columns = left_x_count - left_max_scroll;
     }
     if (visible_columns < 1) visible_columns = 1;
-    cell_width = (viewport + visible_columns - 1) / visible_columns;
-    if (cell_width < 1) cell_width = 1;
+    cell_width = measure_editor_cell_width(
+        left_editor, right_editor, left_window, right_window,
+        left_max_scroll, right_max_scroll);
+    if (cell_width < 1 || cell_width > 64) {
+        cell_width = editor_cell_width(left_window);
+    }
+    if (cell_width < 1 || cell_width > 64) {
+        cell_width = (viewport + visible_columns - 1) / visible_columns;
+        if (cell_width < 1) cell_width = 1;
+    }
     content_width = viewport + max_scroll * cell_width;
     if (content_width > MAX_CAPTURE_WIDTH) content_width = MAX_CAPTURE_WIDTH;
     if (!strip_create(&pair->left, FIXED_GUTTER_WIDTH + content_width,
@@ -339,20 +468,51 @@ static BOOL capture_current_pair(ViewState *view, SelectedPair *pair) {
     }
 
     old_left_x = g_bc3.get_left_x(left_editor);
-    for (offset = 0; offset < content_width; offset += viewport) {
+    old_right_x = g_bc3.get_left_x(right_editor);
+    for (offset = 0; offset < content_width;) {
         TempSurface left_capture;
         TempSurface right_capture;
         int scroll_position = offset / cell_width;
-        int source_x;
-        int copy_width = content_width - offset;
-        if (copy_width > viewport) copy_width = viewport;
+        int left_source_x;
+        int right_source_x;
+        int left_available;
+        int right_available;
+        int left_copy_width;
+        int right_copy_width;
+        int copy_width;
         if (scroll_position > max_scroll) scroll_position = max_scroll;
-        source_x = FIXED_GUTTER_WIDTH + offset -
-                   scroll_position * cell_width;
         g_bc3.set_left_x(left_editor, scroll_position);
+        g_bc3.set_left_x(right_editor, scroll_position);
+        left_source_x = FIXED_GUTTER_WIDTH + offset -
+                        g_bc3.get_left_x(left_editor) * cell_width;
+        right_source_x = FIXED_GUTTER_WIDTH + offset -
+                         g_bc3.get_left_x(right_editor) * cell_width;
         if (!capture_editor(left_window, &left_capture)) break;
         if (!capture_editor(right_window, &right_capture)) {
             surface_destroy(&left_capture);
+            break;
+        }
+        /* The editors scroll in whole character cells.  When viewport width
+           is not a multiple of cell_width, the source coordinates are a few
+           pixels past the gutter.  Copy only the pixels that actually remain
+           in both captured DIBs; a full viewport would overrun later pages. */
+        left_available = left_capture.width - left_source_x;
+        right_available = right_capture.width - right_source_x;
+        if (left_available < 0) left_available = 0;
+        if (right_available < 0) right_available = 0;
+        if (left_available > 0 && right_available > 0) {
+            copy_width = left_available < right_available
+                             ? left_available : right_available;
+        } else {
+            copy_width = left_available > right_available
+                             ? left_available : right_available;
+        }
+        if (content_width - offset < copy_width) {
+            copy_width = content_width - offset;
+        }
+        if (copy_width <= 0) {
+            surface_destroy(&left_capture);
+            surface_destroy(&right_capture);
             break;
         }
         if (offset == 0) {
@@ -361,17 +521,27 @@ static BOOL capture_current_pair(ViewState *view, SelectedPair *pair) {
             BitBlt(pair->right.dc, 0, 0, FIXED_GUTTER_WIDTH,
                    pair->right.height, right_capture.dc, 0, 0, SRCCOPY);
         }
-        BitBlt(pair->left.dc, FIXED_GUTTER_WIDTH + offset, 0, copy_width,
-               pair->left.height, left_capture.dc, source_x, 0,
-               SRCCOPY);
-        BitBlt(pair->right.dc, FIXED_GUTTER_WIDTH + offset, 0, copy_width,
-               pair->right.height, right_capture.dc, source_x, 0,
-               SRCCOPY);
+        left_copy_width = left_available < copy_width
+                              ? left_available : copy_width;
+        right_copy_width = right_available < copy_width
+                               ? right_available : copy_width;
+        if (left_copy_width > 0) {
+            BitBlt(pair->left.dc, FIXED_GUTTER_WIDTH + offset, 0,
+                   left_copy_width, pair->left.height, left_capture.dc,
+                   left_source_x, 0, SRCCOPY);
+        }
+        if (right_copy_width > 0) {
+            BitBlt(pair->right.dc, FIXED_GUTTER_WIDTH + offset, 0,
+                   right_copy_width, pair->right.height, right_capture.dc,
+                   right_source_x, 0, SRCCOPY);
+        }
         surface_destroy(&left_capture);
         surface_destroy(&right_capture);
         ok = TRUE;
+        offset += copy_width;
     }
     g_bc3.set_left_x(left_editor, old_left_x);
+    g_bc3.set_left_x(right_editor, old_right_x);
     InvalidateRect(left_window, NULL, TRUE);
     InvalidateRect(right_window, NULL, TRUE);
     return ok;

@@ -1,6 +1,6 @@
 1 VERSIONINFO
- FILEVERSION 0,1,0,0
- PRODUCTVERSION 0,1,0,0
+ FILEVERSION 0,1,1,0
+ PRODUCTVERSION 0,1,1,0
  FILEFLAGSMASK 0x3fL
  FILEFLAGS 0x0L
  FILEOS 0x40004L
@@ -13,11 +13,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "BC3 MultiDetails Project"
             VALUE "FileDescription", "Multi-line Text Details extension for Beyond Compare 3"
-            VALUE "FileVersion", "0.1.0.0"
+            VALUE "FileVersion", "0.1.1.0"
             VALUE "InternalName", "version.dll"
             VALUE "OriginalFilename", "version.dll"
             VALUE "ProductName", "BC3 MultiDetails"
-            VALUE "ProductVersion", "0.1.0"
+            VALUE "ProductVersion", "0.1.1"
         END
     END
     BLOCK "VarFileInfo"

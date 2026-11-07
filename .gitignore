@@ -17,6 +17,8 @@
 !/screenshots/bc3-installer-ctrl-shift-regression.png
 !/screenshots/bc3-shared-horizontal-after-fixed.png
 !/screenshots/bc3-installer-final.png
+!/screenshots/bc3-v011-long-scroll-fixed.png
+!/screenshots/bc3-v011-multiselect-scroll.png
 
 *.bmp
 *.xwd

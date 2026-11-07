@@ -3,7 +3,7 @@
 为 Windows 版 Beyond Compare 3.3.5（build 15075）增加可自定义多行的
 Text Details 面板。
 
-[下载 BC3MultiDetails-Setup-0.1.0.exe](https://github.com/CinderellaQAQ/beyond_compare_rea/releases/latest/download/BC3MultiDetails-Setup-0.1.0.exe)
+[下载 BC3MultiDetails-Setup-0.1.1.exe](https://github.com/CinderellaQAQ/beyond_compare_rea/releases/latest/download/BC3MultiDetails-Setup-0.1.1.exe)
 
 ## 效果
 
@@ -45,9 +45,13 @@ Software 官网目前只公开提供 BC3 最终版 3.3.13，以下 3.3.5 安装�
 ## 安装
 
 1. 关闭所有 `BCompare.exe` 进程。
-2. 运行 `BC3MultiDetails-Setup-0.1.0.exe`。
+2. 运行 `BC3MultiDetails-Setup-0.1.1.exe`。
 3. 选择含有 `BCompare.exe` 的 Beyond Compare 3 安装目录，然后点击 **Install**。
 4. 重新启动 Beyond Compare，打开 Text Compare 会话。
+
+若已经安装本项目发布的 0.1.0，可直接运行 0.1.1 原地升级，无需先卸载。
+升级器只会替换 SHA-256 精确匹配 0.1.0 发布物的 DLL 与卸载器；未知
+`version.dll` 仍会被安全保留并中止安装。
 
 安装器请求管理员权限是因为默认安装位置通常位于 Program Files。它不包含
 Beyond Compare 的任何程序文件，也不会修改 `BCompare.exe`。
@@ -58,6 +62,18 @@ Beyond Compare 的任何程序文件，也不会修改 `BCompare.exe`。
 - SHA-256：`1d822b3faabb8f65fc30076d32a95757a2c369ccb64ae54572e9f562280ae845`
 
 若目标目录已有其他 `version.dll`，安装会安全中止，不覆盖该文件。
+
+## 0.1.1 修复
+
+- 修复长差异行横向滚动一段距离后出现重复、错位或空白内容的问题。
+- 缓存时显式同步左右原生 Text Details 编辑器，并按实际渲染位移测量列宽。
+- 分段拼接只复制当前位图真实可用的像素，避免越界读取。
+- 支持从本项目正式发布的 0.1.0 安全原地升级。
+
+下图为 7,000 余字符差异行滚动 12 个底部视口后的结果；左右内容仍连续且
+保持同一横向位置。
+
+![0.1.1 超长行滚动修复](screenshots/bc3-v011-long-scroll-fixed.png)
 
 安装包尚未进行商业代码签名；Windows 可能显示 SmartScreen 提示。请先核对
 本文末尾的 SHA-256，再决定是否运行。
@@ -101,9 +117,9 @@ make CC=/path/to/i686-w64-mingw32-gcc \
 输出：
 
 - `dist/version.dll`
-- `dist/BC3MultiDetails-Setup-0.1.0.exe`
+- `dist/BC3MultiDetails-Setup-0.1.1.exe`
 
 本次最终构建 SHA-256：
 
-- 安装包：`7ff057913edc80544f1f753023826bcbb38dc26e0531fd1fce9146747f96b69b`
-- 扩展 DLL：`50da924ee931b3e247c013ac9f9f91e5dc3175ab356c3a6f6a45ea1a0b4185d8`
+- 安装包：`b14940e8015d0955eeacbb661d8fdcec699265290e7f151adae62c44480dfdde`
+- 扩展 DLL：`207a64a00940f24e8560c97429d768cb0251d145ddec4a6597c98e664b9c91de`
