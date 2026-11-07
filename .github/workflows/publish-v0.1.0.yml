@@ -50,10 +50,12 @@ jobs:
           done
           echo "7ff057913edc80544f1f753023826bcbb38dc26e0531fd1fce9146747f96b69b  $asset" \
             | sha256sum --check -
-          if gh release view v0.1.0 >/dev/null 2>&1; then
-            gh release upload v0.1.0 "$asset#Windows 安装程序" --clobber
+          if gh release view v0.1.0 --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload v0.1.0 "$asset#Windows 安装程序" --clobber \
+              --repo "$GITHUB_REPOSITORY"
           else
             gh release create v0.1.0 "$asset#Windows 安装程序" \
+              --repo "$GITHUB_REPOSITORY" \
               --target "$GITHUB_SHA" \
               --title "BC3 MultiDetails v0.1.0" \
               --latest \
