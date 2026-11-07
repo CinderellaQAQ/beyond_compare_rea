@@ -27,6 +27,21 @@ Text Details 面板。
 滚动条控制全部 L/R 行；上方左右正文区的横向位置不会被改变。选择较多时，
 底部面板最高扩展到 360 像素，并提供自己的纵向滚动条。
 
+## 目标版本下载
+
+本扩展只支持 Windows 版 Beyond Compare 3.3.5（build 15075）。Scooter
+Software 官网目前只公开提供 BC3 最终版 3.3.13，以下 3.3.5 安装包来自第三方
+历史镜像，并非官方当前下载地址：
+
+- [下载 BCompare-3.3.5.15075.exe](https://www3.btsoftware.com/pub/download/nt/BCompare-3.3.5.15075.exe)
+- 安装包大小：`5,869,768` 字节
+- 安装包 SHA-256：`19bf30d2dd518aae1dd3425d77e88c1700460fad9fe6b7e5f5821425798cbb6e`
+- 安装后的 `BCompare.exe` SHA-256：`1d822b3faabb8f65fc30076d32a95757a2c369ccb64ae54572e9f562280ae845`
+
+该镜像文件已与本项目逆向和测试所用安装包逐字节比对一致。由于来源为第三方
+且软件版本较旧，请在下载后核对 SHA-256，并优先在隔离测试环境中使用。软件
+许可仍由 Scooter Software 提供，用户应自行确保拥有合法使用资格。
+
 ## 安装
 
 1. 关闭所有 `BCompare.exe` 进程。
