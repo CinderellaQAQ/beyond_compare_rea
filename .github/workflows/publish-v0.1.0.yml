@@ -1,0 +1,73 @@
+name: Publish v0.1.0
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/publish-v0.1.0.yml
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Reassemble and publish installer
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset="BC3MultiDetails-Setup-0.1.0.exe"
+          chunks=(
+            13a642b0ed3c138030ac5d2484786a1dcd9940a5
+            72ea6787f9300c39c52b30c792c473f9eec09484
+            12f3be4dd3b5a2b5146f36630acbf7e99e490797
+            4cb64531ac1f0b727828ea793c0109652519536d
+            675eb8559c819c0a54c07b0d981c7f430f9722cb
+            0c2f29c8e3c90c963a559b55c6f6e277a88ee08c
+            6ba2384949b861ff588de40e29f826b20a017419
+            c6c3bd208f40bd9fac1bb9d4de1baab6e0fecca5
+            f1d74444732eeab1aa3a8b3cf9f0e8a3339343ea
+            15f52b4ebd64f53265e7c7fd89b00c51a755c320
+            674a7da50646141b9c46de9a5c6bdceb43bef0d3
+            185f9623656900487b232e182e86164bf93b00ed
+            6b543a6697a246dbe7cd88be3b763e4cc6fce10d
+            11531405858f0a413b5a65425b29fff510c16ae6
+            6ddd7d2f3dce456aaf7717bc491d232fe2692a5d
+            9ce5127d19c70429bb4b49636d2e5192dd36b702
+            b99cf7e307302a1684b59d9ec3467a32eb457dad
+            9259e49e5665319b98ada4c28fbd7694d9b88ce3
+            04e8f3fc215cb33ed5fb4e11fb3fb386ef42664a
+            71fb7b25ca7effc1bca75bdf140bbd30765cd0c4
+            0adf429d2aecb3b9b3a16bf942e6fb6b50ecc730
+          )
+          : > "$asset"
+          for blob in "${chunks[@]}"; do
+            gh api "repos/${GITHUB_REPOSITORY}/git/blobs/${blob}" --jq .content \
+              | tr -d '\n' | base64 --decode >> "$asset"
+          done
+          echo "7ff057913edc80544f1f753023826bcbb38dc26e0531fd1fce9146747f96b69b  $asset" \
+            | sha256sum --check -
+          if gh release view v0.1.0 >/dev/null 2>&1; then
+            gh release upload v0.1.0 "$asset#Windows 安装程序" --clobber
+          else
+            gh release create v0.1.0 "$asset#Windows 安装程序" \
+              --target "$GITHUB_SHA" \
+              --title "BC3 MultiDetails v0.1.0" \
+              --latest \
+              --notes-file - <<'RELEASE_NOTES'
+          为 Windows 版 Beyond Compare 3.3.5（build 15075）增加可自定义多行的 Text Details 面板。
+
+          - 支持 Ctrl 选择/取消不连续行
+          - 支持 Shift 连续选择及 Ctrl+Shift 追加区间
+          - 每个选择显示一组 L/R 原生字符级差异
+          - 底部唯一横向滚动条同步移动全部 L/R 条带
+          - 上方正文区横向位置保持不变
+
+          安装包 SHA-256：`7ff057913edc80544f1f753023826bcbb38dc26e0531fd1fce9146747f96b69b`
+
+          注意：安装包未进行商业代码签名，Windows 可能显示 SmartScreen 提示。
+          RELEASE_NOTES
+          fi
