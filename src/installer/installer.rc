@@ -16,8 +16,8 @@
 #define IDCANCEL 2
 
 1 VERSIONINFO
- FILEVERSION 0,2,0,0
- PRODUCTVERSION 0,2,0,0
+ FILEVERSION 0,2,1,0
+ PRODUCTVERSION 0,2,1,0
  FILEFLAGSMASK 0x3fL
  FILEFLAGS 0x0L
  FILEOS 0x40004L
@@ -30,11 +30,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "BC3 MultiDetails Project"
             VALUE "FileDescription", "Setup for BC3 MultiDetails"
-            VALUE "FileVersion", "0.2.0.0"
+            VALUE "FileVersion", "0.2.1.0"
             VALUE "InternalName", "BC3MultiDetailsSetup.exe"
             VALUE "OriginalFilename", "BC3MultiDetailsSetup.exe"
             VALUE "ProductName", "BC3 MultiDetails"
-            VALUE "ProductVersion", "0.2.0"
+            VALUE "ProductVersion", "0.2.1"
         END
     END
     BLOCK "VarFileInfo"

@@ -20,7 +20,12 @@ enum {
     BC3_RVA_EDITOR_GET_MAX_LEFT_X_CORE = 0x0025a2cc,
     BC3_RVA_EDITOR_GET_TOP_ITEM  = 0x0025f340,
     BC3_RVA_EDITOR_SET_TOP_ITEM  = 0x0025f350,
-    BC3_RVA_CONTROL_SET_HEIGHT   = 0x000b4a80
+    BC3_RVA_EDITOR_SET_DATA_SOURCE = 0x0025f040,
+    BC3_RVA_EDITOR_SET_OPTION    = 0x00259068,
+    BC3_RVA_EDITOR_EXECUTE_COMMAND = 0x0025ed64,
+    BC3_RVA_CONTROL_SET_HEIGHT   = 0x000b4a80,
+    BC3_RVA_STREAM_LINE_PARSER_CREATE = 0x00156838,
+    BC3_RVA_SOURCE_LINE_CATEGORY = 0x0050a230
 };
 
 /* TTextViewFrame fields recovered from ViewText.pas RTTI and code use. */
@@ -41,6 +46,10 @@ typedef struct Bc3Api {
     int (__cdecl *get_max_left_x)(void *editor);
     int (__cdecl *get_top_item)(void *editor);
     void (__cdecl *set_top_item)(void *editor, int item);
+    void (__cdecl *set_data_source)(void *editor, void *source);
+    void (__cdecl *set_option)(void *editor, int option, BOOL enabled);
+    void (__cdecl *execute_command)(void *editor, int command,
+                                    void *parameter);
     void (__cdecl *set_control_height)(void *control, int height);
     void (__cdecl *notify_current_changed)(void *frame, void *sender);
 } Bc3Api;
@@ -52,5 +61,27 @@ void *bc3_frame_main_editor(void *frame, int index);
 void *bc3_frame_detail_editor(void *frame, int index);
 void *bc3_frame_details_panel(void *frame);
 HWND bc3_find_control_window(void *control);
+int bc3_editor_item_count(void *editor);
+void *bc3_editor_data_source(void *editor);
+void bc3_editor_override_current_item(void *editor, int item);
+void bc3_editor_override_top_item(void *editor, int item);
+BOOL bc3_editor_source_item_info(void *editor, int item,
+                                 int *first, int *second);
+int bc3_editor_context(void *editor);
+BOOL bc3_source_item_info(void *source, int context, int item,
+                          int *first, int *second);
+int bc3_source_item_metric(void *source, int item, int mode);
+BOOL bc3_editor_group_bounds(void *editor, int *first, int *last);
+BOOL bc3_editor_native_group(void *editor, int item,
+                             int *first, int *last);
+BOOL bc3_editor_filter_mapping(void *editor, int item,
+                               int *mapped, int *count);
+BOOL bc3_editor_raw_record(void *editor, int item, uint32_t record[5]);
+BOOL bc3_editor_physical_line_bounds(void *editor, int item,
+                                     int *first, int *last);
+int bc3_editor_underlying_line_length(void *editor, int item, int side);
+int bc3_editor_underlying_line_ending(void *editor, int item, int side);
+BOOL bc3_editor_underlying_line_text(void *editor, int item, int side,
+                                     const char **text, int *length);
 
 #endif

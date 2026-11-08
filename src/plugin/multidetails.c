@@ -3,104 +3,313 @@
 #include "bc3_target.h"
 #include "log.h"
 
-#include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <wchar.h>
 #include <windowsx.h>
 
 #define MAX_VIEWS 8
 #define MAX_SELECTIONS 128
+#define MAX_PROXY_ITEMS 2048
+#define SOURCE_VTABLE_SLOTS 21
 #define MAX_EDITOR_SIDES 4
-#define OVERLAY_CLASS L"BC3MultiDetailsOverlay"
-#define HEADER_HEIGHT 24
-#define CAPTION_HEIGHT 18
-#define SCROLLBAR_HEIGHT 17
-#define FIXED_GUTTER_WIDTH 18
-#define MAX_CAPTURE_WIDTH 32768
+#define MAX_VISIBLE_ROWS 8
+#define MAX_PANEL_HEIGHT 360
+#define MESSAGE_CLASS L"BC3MultiDetailsNativeMessages"
 #define WM_MD_APPLY_SELECTION (WM_APP + 0x310)
+#define WM_MD_SYNC_DETAIL (WM_APP + 0x311)
 #define SELECTION_CONTROL 0x01
 #define SELECTION_SHIFT 0x02
-#define COPY_REFOCUS_TIMER 0x4d44
+#define EDITOR_OPTION_SELECTION 0x0c
+#define EDITOR_OPTION_SINGLE_ROW 0x13
+#define EDITOR_COMMAND_COPY 1
+#ifndef WM_MOUSEHWHEEL
+#define WM_MOUSEHWHEEL 0x020e
+#endif
 
-typedef struct CapturedStrip {
-    HBITMAP bitmap;
-    HDC dc;
-    void *bits;
-    int width;
-    int height;
-} CapturedStrip;
+typedef struct NativeSourceProxy {
+    void **vtable;
+    void *owner;
+    int count;
+    int map[MAX_PROXY_ITEMS];
+} NativeSourceProxy;
 
-typedef struct SelectedPair {
+typedef struct SelectedRange {
     int key;
-    int item[MAX_EDITOR_SIDES];
-    int text_length[2];
-    int cell_width;
-    CapturedStrip left;
-    CapturedStrip right;
-} SelectedPair;
+    int first;
+    int last;
+} SelectedRange;
 
 typedef struct ViewState {
     void *frame;
     void *panel_object;
-    void *last_click_sender;
-    HWND panel_window;
-    HWND overlay;
-    HWND horizontal_scroll;
+    void *original_source;
+    NativeSourceProxy proxy;
+    HWND message_window;
     int initial_panel_height;
+    int original_item_count;
+    int base_detail_height[MAX_EDITOR_SIDES];
+    BYTE base_single_row[MAX_EDITOR_SIDES];
+    BOOL base_single_row_captured[MAX_EDITOR_SIDES];
+    BYTE base_selection[MAX_EDITOR_SIDES];
+    BOOL base_selection_captured[MAX_EDITOR_SIDES];
+    int selection_count;
+    SelectedRange selections[MAX_SELECTIONS];
     int anchor;
-    int horizontal_offset;
-    int vertical_offset;
-    int pair_count;
     int active_key;
-    int native_sync_key;
-    int active_side;
-    int caret_column;
-    int selection_anchor;
-    BOOL selecting;
-    BOOL caret_created;
-    BOOL caret_visible;
-    HWND copy_restore_focus;
-    BOOL copy_in_progress;
-    HWND marker_window[MAX_EDITOR_SIDES];
-    WNDPROC marker_original[MAX_EDITOR_SIDES];
-    void *marker_editor[MAX_EDITOR_SIDES];
-    SelectedPair pairs[MAX_SELECTIONS];
+    LONG sequence;
+    LONG last_applied_sequence;
+    BOOL proxy_active;
+    BOOL syncing;
+    BOOL suppress_main_click;
+    HWND marker_window[2];
+    WNDPROC marker_original[2];
+    void *marker_editor[2];
+    HWND detail_inner[MAX_EDITOR_SIDES];
+    WNDPROC detail_inner_original[MAX_EDITOR_SIDES];
 } ViewState;
 
-typedef struct TempSurface {
-    HBITMAP bitmap;
-    HDC dc;
-    void *bits;
-    int width;
-    int height;
-} TempSurface;
+typedef struct SelectionWork {
+    HWND target;
+    int source_count;
+    int key;
+    int flags;
+    LONG sequence;
+    int first;
+    int last;
+} SelectionWork;
 
 static HINSTANCE g_instance;
 static ViewState g_views[MAX_VIEWS];
 static BOOL g_internal_update;
-static HFONT g_ui_font;
+static HHOOK g_message_hook;
 
-static LRESULT CALLBACK overlay_window_proc(HWND window, UINT message,
+/* Recovered TTextEditorItems interface. Native methods still render, select,
+   copy, and scroll; only their item coordinate is translated. */
+void *g_source_original_vtable[SOURCE_VTABLE_SLOTS];
+static void *g_source_proxy_vtable[SOURCE_VTABLE_SLOTS];
+static BOOL g_source_vtable_ready;
+
+#define STRINGIZE_INNER(value) #value
+#define STRINGIZE(value) STRINGIZE_INNER(value)
+
+__attribute__((naked)) static int proxy_get_count(void) {
+    __asm__ __volatile__(
+        "movl 8(%eax), %eax\n\t"
+        "ret\n\t");
+}
+
+/* The main and detail editors share one underlying comparison model. BC3
+   normally detects that by source-object identity. The selected-row proxy is
+   a second read-only view of that same model, so delegating its lock/unlock
+   methods would recursively acquire the model lock during a main-editor
+   click. The outer native operation already owns the required lock. */
+__attribute__((naked)) static void proxy_lock_noop(void) {
+    __asm__ __volatile__("ret\n\t");
+}
+
+#define DEFINE_MAP_THUNK(name, byte_offset)                              \
+    __attribute__((naked)) static void name(void) {                      \
+        __asm__ __volatile__(                                            \
+            "testl %ecx, %ecx\n\t"                                      \
+            "js 1f\n\t"                                                \
+            "cmpl 8(%eax), %ecx\n\t"                                   \
+            "jae 1f\n\t"                                               \
+            "movl 12(%eax,%ecx,4), %ecx\n\t"                           \
+            "jmp *_g_source_original_vtable+" STRINGIZE(byte_offset)    \
+            "\n\t"                                                      \
+            "1:\n\t"                                                    \
+            "xorl %ecx, %ecx\n\t"                                      \
+            "jmp *_g_source_original_vtable+" STRINGIZE(byte_offset)    \
+            "\n\t");                                                    \
+    }
+
+DEFINE_MAP_THUNK(proxy_method_03, 12)
+DEFINE_MAP_THUNK(proxy_method_04, 16)
+DEFINE_MAP_THUNK(proxy_method_05, 20)
+DEFINE_MAP_THUNK(proxy_method_07, 28)
+DEFINE_MAP_THUNK(proxy_method_08, 32)
+DEFINE_MAP_THUNK(proxy_method_09, 36)
+DEFINE_MAP_THUNK(proxy_method_12, 48)
+DEFINE_MAP_THUNK(proxy_method_17, 68)
+
+__attribute__((used)) static void __cdecl proxy_range_to_original(
+    NativeSourceProxy *proxy, int *range) {
+    int field;
+    if (!proxy || !range) return;
+    for (field = 1; field <= 3; field += 2) {
+        int item = range[field];
+        if (item >= 0 && item < proxy->count)
+            range[field] = proxy->map[item];
+    }
+}
+
+__attribute__((used)) static void __cdecl proxy_range_to_local(
+    NativeSourceProxy *proxy, int *range) {
+    int field;
+    if (!proxy || !range) return;
+    for (field = 1; field <= 3; field += 2) {
+        int original = range[field];
+        int item;
+        for (item = 0; item < proxy->count; ++item) {
+            if (proxy->map[item] == original) break;
+        }
+        range[field] = item < proxy->count ? item : 0;
+    }
+}
+
+/* Method 20 receives a single [column, item] position, not a four-field
+   selection range. Reading range[3] here corrupts the editor's adjacent
+   caret state when the user clicks a later proxy row. */
+__attribute__((used)) static void __cdecl proxy_position_to_original(
+    NativeSourceProxy *proxy, int *position) {
+    int item;
+    if (!proxy || !position) return;
+    item = position[1];
+    if (item >= 0 && item < proxy->count)
+        position[1] = proxy->map[item];
+}
+
+__attribute__((used)) static void __cdecl proxy_position_to_local(
+    NativeSourceProxy *proxy, int *position) {
+    int original;
+    int item;
+    if (!proxy || !position) return;
+    original = position[1];
+    for (item = 0; item < proxy->count; ++item) {
+        if (proxy->map[item] == original) break;
+    }
+    position[1] = item < proxy->count ? item : 0;
+}
+
+/* Methods 18 and 19 receive a four-integer text range:
+   [start column, start item, end column, end item]. */
+__attribute__((naked)) static void proxy_method_18(void) {
+    __asm__ __volatile__(
+        "pushl %ebp\n\t"
+        "movl %esp, %ebp\n\t"
+        "pushl %ebx\n\t"
+        "pushl %esi\n\t"
+        "pushl %edi\n\t"
+        "movl %eax, %ebx\n\t"
+        "movl %ecx, %esi\n\t"
+        "movl %edx, %edi\n\t"
+        "pushl %esi\n\t"
+        "pushl %ebx\n\t"
+        "call _proxy_range_to_original\n\t"
+        "addl $8, %esp\n\t"
+        "movl %ebx, %eax\n\t"
+        "movl %edi, %edx\n\t"
+        "movl %esi, %ecx\n\t"
+        "call *_g_source_original_vtable+72\n\t"
+        "pushl %eax\n\t"
+        "pushl %esi\n\t"
+        "pushl %ebx\n\t"
+        "call _proxy_range_to_local\n\t"
+        "addl $8, %esp\n\t"
+        "popl %eax\n\t"
+        "popl %edi\n\t"
+        "popl %esi\n\t"
+        "popl %ebx\n\t"
+        "leave\n\t"
+        "ret\n\t");
+}
+
+#define DEFINE_RANGE_STACK_THUNK(name, byte_offset)                     \
+    __attribute__((naked)) static void name(void) {                     \
+        __asm__ __volatile__(                                           \
+            "pushl %ebp\n\t"                                          \
+            "movl %esp, %ebp\n\t"                                     \
+            "pushl %ebx\n\t"                                         \
+            "pushl %esi\n\t"                                         \
+            "pushl %edi\n\t"                                         \
+            "movl %eax, %ebx\n\t"                                    \
+            "movl %ecx, %esi\n\t"                                    \
+            "movl %edx, %edi\n\t"                                    \
+            "pushl %esi\n\t"                                         \
+            "pushl %ebx\n\t"                                         \
+            "call _proxy_range_to_original\n\t"                      \
+            "addl $8, %esp\n\t"                                      \
+            "movl %ebx, %eax\n\t"                                    \
+            "movl %edi, %edx\n\t"                                    \
+            "movl %esi, %ecx\n\t"                                    \
+            "pushl 8(%ebp)\n\t"                                      \
+            "call *_g_source_original_vtable+" STRINGIZE(byte_offset) \
+            "\n\t"                                                    \
+            "pushl %eax\n\t"                                         \
+            "pushl %esi\n\t"                                         \
+            "pushl %ebx\n\t"                                         \
+            "call _proxy_range_to_local\n\t"                         \
+            "addl $8, %esp\n\t"                                      \
+            "popl %eax\n\t"                                          \
+            "popl %edi\n\t"                                          \
+            "popl %esi\n\t"                                          \
+            "popl %ebx\n\t"                                          \
+            "leave\n\t"                                              \
+            "ret $4\n\t");                                           \
+    }
+
+DEFINE_RANGE_STACK_THUNK(proxy_method_19, 76)
+
+/* Method 20 receives [column, item] plus one stack argument. */
+__attribute__((naked)) static void proxy_method_20(void) {
+    __asm__ __volatile__(
+        "pushl %ebp\n\t"
+        "movl %esp, %ebp\n\t"
+        "pushl %ebx\n\t"
+        "pushl %esi\n\t"
+        "pushl %edi\n\t"
+        "movl %eax, %ebx\n\t"
+        "movl %ecx, %esi\n\t"
+        "movl %edx, %edi\n\t"
+        "pushl %esi\n\t"
+        "pushl %ebx\n\t"
+        "call _proxy_position_to_original\n\t"
+        "addl $8, %esp\n\t"
+        "movl %ebx, %eax\n\t"
+        "movl %edi, %edx\n\t"
+        "movl %esi, %ecx\n\t"
+        "pushl 8(%ebp)\n\t"
+        "call *_g_source_original_vtable+80\n\t"
+        "pushl %eax\n\t"
+        "pushl %esi\n\t"
+        "pushl %ebx\n\t"
+        "call _proxy_position_to_local\n\t"
+        "addl $8, %esp\n\t"
+        "popl %eax\n\t"
+        "popl %edi\n\t"
+        "popl %esi\n\t"
+        "popl %ebx\n\t"
+        "leave\n\t"
+        "ret $4\n\t");
+}
+
+static LRESULT CALLBACK message_window_proc(HWND window, UINT message,
                                             WPARAM wparam, LPARAM lparam);
 static LRESULT CALLBACK marker_window_proc(HWND window, UINT message,
                                            WPARAM wparam, LPARAM lparam);
+static LRESULT CALLBACK detail_inner_proc(HWND window, UINT message,
+                                          WPARAM wparam, LPARAM lparam);
+static LRESULT CALLBACK ui_message_hook(int code, WPARAM wparam,
+                                        LPARAM lparam);
 
-static ViewState *view_from_marker(HWND window, int *side_out) {
-    int view_index;
-    int side;
-    for (view_index = 0; view_index < MAX_VIEWS; ++view_index) {
-        for (side = 0; side < MAX_EDITOR_SIDES; ++side) {
-            if (g_views[view_index].marker_window[side] == window) {
-                if (side_out) *side_out = side;
-                return &g_views[view_index];
-            }
-        }
+static ViewState *view_find(void *frame, BOOL create) {
+    int index;
+    ViewState *empty = NULL;
+    for (index = 0; index < MAX_VIEWS; ++index) {
+        if (g_views[index].frame == frame) return &g_views[index];
+        if (!g_views[index].frame && !empty) empty = &g_views[index];
     }
-    return NULL;
+    if (!create || !empty) return NULL;
+    ZeroMemory(empty, sizeof(*empty));
+    empty->frame = frame;
+    empty->anchor = -1;
+    empty->active_key = -1;
+    return empty;
 }
 
-static BOOL CALLBACK find_editor_window_child(HWND window, LPARAM parameter) {
+static BOOL CALLBACK find_editor_window_child(HWND window,
+                                               LPARAM parameter) {
     HWND *result = (HWND *)parameter;
     WCHAR class_name[128];
     GetClassNameW(window, class_name, 128);
@@ -111,7 +320,7 @@ static BOOL CALLBACK find_editor_window_child(HWND window, LPARAM parameter) {
     return TRUE;
 }
 
-static HWND editor_paint_window(void *editor) {
+static HWND editor_inner_window(void *editor) {
     HWND outer = bc3_find_control_window(editor);
     HWND inner = NULL;
     if (!outer) return NULL;
@@ -119,901 +328,501 @@ static HWND editor_paint_window(void *editor) {
     return inner ? inner : outer;
 }
 
-static void ensure_marker_windows(ViewState *view) {
+static ViewState *view_from_marker(HWND window, int *side_out) {
+    int view_index;
+    int side;
+    for (view_index = 0; view_index < MAX_VIEWS; ++view_index) {
+        for (side = 0; side < 2; ++side) {
+            if (g_views[view_index].marker_window[side] == window) {
+                if (side_out) *side_out = side;
+                return &g_views[view_index];
+            }
+        }
+    }
+    return NULL;
+}
+
+static ViewState *view_from_detail(HWND window, int *side_out) {
+    int view_index;
+    int side;
+    for (view_index = 0; view_index < MAX_VIEWS; ++view_index) {
+        for (side = 0; side < MAX_EDITOR_SIDES; ++side) {
+            if (g_views[view_index].detail_inner[side] == window) {
+                if (side_out) *side_out = side;
+                return &g_views[view_index];
+            }
+        }
+    }
+    return NULL;
+}
+
+static void initialize_proxy_vtable(void *source) {
+    void **vtable;
+    if (g_source_vtable_ready || !source) return;
+    vtable = *(void ***)source;
+    if (!vtable) return;
+    memcpy(g_source_original_vtable, vtable,
+           sizeof(g_source_original_vtable));
+    memcpy(g_source_proxy_vtable, vtable, sizeof(g_source_proxy_vtable));
+    g_source_proxy_vtable[1] = proxy_get_count;
+    g_source_proxy_vtable[3] = proxy_method_03;
+    g_source_proxy_vtable[4] = proxy_method_04;
+    g_source_proxy_vtable[5] = proxy_method_05;
+    g_source_proxy_vtable[7] = proxy_method_07;
+    g_source_proxy_vtable[8] = proxy_method_08;
+    g_source_proxy_vtable[9] = proxy_method_09;
+    g_source_proxy_vtable[12] = proxy_method_12;
+    g_source_proxy_vtable[15] = proxy_lock_noop;
+    g_source_proxy_vtable[16] = proxy_lock_noop;
+    g_source_proxy_vtable[17] = proxy_method_17;
+    g_source_proxy_vtable[18] = proxy_method_18;
+    g_source_proxy_vtable[19] = proxy_method_19;
+    g_source_proxy_vtable[20] = proxy_method_20;
+    g_source_vtable_ready = TRUE;
+}
+
+static void ensure_message_window(ViewState *view) {
+    if (view->message_window && IsWindow(view->message_window)) return;
+    view->message_window = CreateWindowExW(
+        0, MESSAGE_CLASS, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, NULL,
+        g_instance, view);
+}
+
+static void ensure_window_hooks(ViewState *view) {
     int side;
     for (side = 0; side < 2; ++side) {
         void *editor = bc3_frame_main_editor(view->frame, side);
-        HWND outer;
-        HWND inner = NULL;
-        if (!editor || (view->marker_window[side] &&
-                        IsWindow(view->marker_window[side]))) {
-            continue;
-        }
-        outer = bc3_find_control_window(editor);
-        if (!outer) continue;
-        EnumChildWindows(outer, find_editor_window_child, (LPARAM)&inner);
-        if (!inner) continue;
-        view->marker_editor[side] = editor;
-        view->marker_window[side] = inner;
-        view->marker_original[side] = (WNDPROC)SetWindowLongPtrW(
-            inner, GWLP_WNDPROC, (LONG_PTR)marker_window_proc);
-    }
-}
-
-static void strip_destroy(CapturedStrip *strip) {
-    if (strip->dc) {
-        DeleteDC(strip->dc);
-    }
-    if (strip->bitmap) {
-        DeleteObject(strip->bitmap);
-    }
-    ZeroMemory(strip, sizeof(*strip));
-}
-
-static BOOL surface_create(TempSurface *surface, int width, int height) {
-    BITMAPINFO info;
-    HDC screen;
-    ZeroMemory(surface, sizeof(*surface));
-    ZeroMemory(&info, sizeof(info));
-    info.bmiHeader.biSize = sizeof(info.bmiHeader);
-    info.bmiHeader.biWidth = width;
-    info.bmiHeader.biHeight = -height;
-    info.bmiHeader.biPlanes = 1;
-    info.bmiHeader.biBitCount = 32;
-    info.bmiHeader.biCompression = BI_RGB;
-    screen = GetDC(NULL);
-    surface->dc = CreateCompatibleDC(screen);
-    surface->bitmap = CreateDIBSection(screen, &info, DIB_RGB_COLORS,
-                                       &surface->bits, NULL, 0);
-    ReleaseDC(NULL, screen);
-    if (!surface->dc || !surface->bitmap) {
-        if (surface->dc) DeleteDC(surface->dc);
-        if (surface->bitmap) DeleteObject(surface->bitmap);
-        ZeroMemory(surface, sizeof(*surface));
-        return FALSE;
-    }
-    SelectObject(surface->dc, surface->bitmap);
-    surface->width = width;
-    surface->height = height;
-    return TRUE;
-}
-
-static void surface_destroy(TempSurface *surface) {
-    if (surface->dc) DeleteDC(surface->dc);
-    if (surface->bitmap) DeleteObject(surface->bitmap);
-    ZeroMemory(surface, sizeof(*surface));
-}
-
-static BOOL strip_create(CapturedStrip *strip, int width, int height) {
-    TempSurface surface;
-    RECT rect;
-    if (!surface_create(&surface, width, height)) {
-        return FALSE;
-    }
-    SetRect(&rect, 0, 0, width, height);
-    FillRect(surface.dc, &rect, GetSysColorBrush(COLOR_WINDOW));
-    strip_destroy(strip);
-    strip->bitmap = surface.bitmap;
-    strip->dc = surface.dc;
-    strip->bits = surface.bits;
-    strip->width = width;
-    strip->height = height;
-    return TRUE;
-}
-
-static ViewState *view_from_overlay(HWND overlay) {
-    return (ViewState *)GetWindowLongPtrW(overlay, GWLP_USERDATA);
-}
-
-static ViewState *view_find(void *frame, BOOL create) {
-    int index;
-    ViewState *empty = NULL;
-    for (index = 0; index < MAX_VIEWS; ++index) {
-        if (g_views[index].frame == frame) {
-            return &g_views[index];
-        }
-        if (!g_views[index].frame && !empty) {
-            empty = &g_views[index];
+        HWND inner = editor_inner_window(editor);
+        if (inner && (!view->marker_window[side] ||
+                      !IsWindow(view->marker_window[side]))) {
+            view->marker_editor[side] = editor;
+            view->marker_window[side] = inner;
+            view->marker_original[side] = (WNDPROC)SetWindowLongPtrW(
+                inner, GWLP_WNDPROC, (LONG_PTR)marker_window_proc);
         }
     }
-    if (!create || !empty) {
-        return NULL;
-    }
-    ZeroMemory(empty, sizeof(*empty));
-    empty->frame = frame;
-    empty->anchor = -1;
-    empty->active_key = -1;
-    empty->native_sync_key = -1;
-    return empty;
-}
-
-static int pair_compare(const void *left, const void *right) {
-    const SelectedPair *a = (const SelectedPair *)left;
-    const SelectedPair *b = (const SelectedPair *)right;
-    return (a->key > b->key) - (a->key < b->key);
-}
-
-static int pair_index(const ViewState *view, int key) {
-    int index;
-    for (index = 0; index < view->pair_count; ++index) {
-        if (view->pairs[index].key == key) return index;
-    }
-    return -1;
-}
-
-static void pair_remove(ViewState *view, int index) {
-    int move_count;
-    if (index < 0 || index >= view->pair_count) return;
-    if (view->active_key == view->pairs[index].key) {
-        view->active_key = -1;
-        view->caret_column = 0;
-        view->selection_anchor = 0;
-        view->selecting = FALSE;
-    }
-    strip_destroy(&view->pairs[index].left);
-    strip_destroy(&view->pairs[index].right);
-    move_count = view->pair_count - index - 1;
-    if (move_count > 0) {
-        memmove(&view->pairs[index], &view->pairs[index + 1],
-                (size_t)move_count * sizeof(view->pairs[0]));
-    }
-    --view->pair_count;
-    ZeroMemory(&view->pairs[view->pair_count], sizeof(view->pairs[0]));
-}
-
-static void pairs_clear(ViewState *view) {
-    while (view->pair_count > 0) {
-        pair_remove(view, view->pair_count - 1);
-    }
-}
-
-static SelectedPair *active_pair(ViewState *view) {
-    int index;
-    if (!view || view->active_key < 0) return NULL;
-    index = pair_index(view, view->active_key);
-    return index >= 0 ? &view->pairs[index] : NULL;
-}
-
-static int clamp_column(const SelectedPair *pair, int side, int column) {
-    int length;
-    if (!pair || side < 0 || side > 1) return 0;
-    length = pair->text_length[side];
-    if (length < 0) length = 0;
-    if (column < 0) return 0;
-    if (column > length) return length;
-    return column;
-}
-
-static BOOL detail_hit_test(ViewState *view, int x, int y,
-                            SelectedPair **pair_out, int *side_out,
-                            int *column_out) {
-    int row_y;
-    int index;
-    if (!view || x < FIXED_GUTTER_WIDTH) return FALSE;
-    row_y = HEADER_HEIGHT - view->vertical_offset;
-    for (index = 0; index < view->pair_count; ++index) {
-        SelectedPair *pair = &view->pairs[index];
-        int left_top = row_y + CAPTION_HEIGHT;
-        int right_top = left_top + pair->left.height;
-        int side = -1;
-        int column;
-        if (y >= left_top && y < left_top + pair->left.height) side = 0;
-        if (y >= right_top && y < right_top + pair->right.height) side = 1;
-        if (side >= 0) {
-            int width = pair->cell_width > 0 ? pair->cell_width : 1;
-            int content_x = view->horizontal_offset +
-                            x - FIXED_GUTTER_WIDTH;
-            column = (content_x + width / 2) / width;
-            if (pair_out) *pair_out = pair;
-            if (side_out) *side_out = side;
-            if (column_out)
-                *column_out = clamp_column(pair, side, column);
-            return TRUE;
+    for (side = 0; side < MAX_EDITOR_SIDES; ++side) {
+        void *editor = bc3_frame_detail_editor(view->frame, side);
+        HWND inner = editor ? editor_inner_window(editor) : NULL;
+        if (inner && (!view->detail_inner[side] ||
+                      !IsWindow(view->detail_inner[side]))) {
+            view->detail_inner[side] = inner;
+            view->detail_inner_original[side] =
+                (WNDPROC)SetWindowLongPtrW(
+                    inner, GWLP_WNDPROC, (LONG_PTR)detail_inner_proc);
         }
-        row_y += CAPTION_HEIGHT + pair->left.height +
-                 pair->right.height + 3;
     }
-    return FALSE;
+    if (!g_message_hook) {
+        DWORD thread = GetCurrentThreadId();
+        g_message_hook = SetWindowsHookExW(
+            WH_GETMESSAGE, ui_message_hook, g_instance,
+            thread);
+        if (!g_message_hook)
+            log_line("Native detail copy command hook failed");
+    }
 }
 
-static int active_strip_top(ViewState *view, const SelectedPair *active) {
-    int y = HEADER_HEIGHT - view->vertical_offset;
-    int index;
-    for (index = 0; index < view->pair_count; ++index) {
-        const SelectedPair *pair = &view->pairs[index];
-        if (pair == active) {
-            y += CAPTION_HEIGHT;
-            if (view->active_side == 1) y += pair->left.height;
-            return y;
-        }
-        y += CAPTION_HEIGHT + pair->left.height + pair->right.height + 3;
-    }
-    return -1000;
-}
-
-static void update_overlay_caret(ViewState *view) {
-    SelectedPair *pair;
-    int x;
-    int y;
-    if (!view || !view->overlay || GetFocus() != view->overlay) return;
-    pair = active_pair(view);
-    if (!view->caret_created) {
-        if (!CreateCaret(view->overlay, NULL, 2, 15)) return;
-        view->caret_created = TRUE;
-    }
-    if (!view->caret_visible) {
-        ShowCaret(view->overlay);
-        view->caret_visible = TRUE;
-    }
-    if (!pair) {
-        SetCaretPos(-100, -100);
-        return;
-    }
-    x = FIXED_GUTTER_WIDTH +
-        view->caret_column * (pair->cell_width > 0 ? pair->cell_width : 1) -
-        view->horizontal_offset;
-    y = active_strip_top(view, pair);
-    SetCaretPos(x, y);
-}
-
-static void ensure_bottom_caret_visible(ViewState *view) {
-    SelectedPair *pair = active_pair(view);
-    RECT client;
-    SCROLLINFO info;
-    int cell_width;
-    int pixel;
-    int page;
-    int position;
-    if (!pair || !view->horizontal_scroll ||
-        !GetClientRect(view->overlay, &client)) return;
-    cell_width = pair->cell_width > 0 ? pair->cell_width : 1;
-    pixel = view->caret_column * cell_width;
-    page = client.right - FIXED_GUTTER_WIDTH;
-    if (page < cell_width) page = cell_width;
-    position = view->horizontal_offset;
-    if (pixel < position) position = pixel;
-    if (pixel > position + page - cell_width)
-        position = pixel - page + cell_width;
-    ZeroMemory(&info, sizeof(info));
-    info.cbSize = sizeof(info);
-    info.fMask = SIF_POS;
-    info.nPos = position;
-    SetScrollInfo(view->horizontal_scroll, SB_CTL, &info, TRUE);
-    view->horizontal_offset =
-        GetScrollPos(view->horizontal_scroll, SB_CTL);
-}
-
-static void sync_upper_to_caret(ViewState *view) {
-    SelectedPair *pair = active_pair(view);
+static BOOL ensure_view(ViewState *view) {
+    void *detail;
     int side;
-    if (!pair) return;
-    g_internal_update = TRUE;
-    for (side = 0; side < 2; ++side) {
-        void *editor = bc3_frame_main_editor(view->frame, side);
-        if (editor && pair->item[side] >= 0)
-            g_bc3.set_cur_item(editor, pair->item[side]);
-    }
-    if (g_bc3.notify_current_changed &&
-        view->native_sync_key != pair->key) {
-        void *sender = view->last_click_sender;
-        if (!sender)
-            sender = bc3_frame_main_editor(view->frame,
-                                           view->active_side);
-        if (sender) {
-            g_bc3.notify_current_changed(view->frame, sender);
-            view->native_sync_key = pair->key;
-        }
-    }
-    for (side = 0; side < 2; ++side) {
-        void *editor = bc3_frame_main_editor(view->frame, side);
-        HWND paint_window;
-        RECT client;
-        int visible_columns = 1;
-        int target;
-        int maximum;
-        if (!editor) continue;
-        paint_window = editor_paint_window(editor);
-        if (paint_window && GetClientRect(paint_window, &client) &&
-            pair->cell_width > 0) {
-            visible_columns =
-                (client.right - FIXED_GUTTER_WIDTH) / pair->cell_width;
-            if (visible_columns < 1) visible_columns = 1;
-        }
-        target = view->caret_column - visible_columns / 2;
-        if (target < 0) target = 0;
-        maximum = g_bc3.get_max_left_x(editor);
-        if (maximum < 0) maximum = 0;
-        if (target > maximum) target = maximum;
-        g_bc3.set_left_x(editor, target);
-        if (paint_window) InvalidateRect(paint_window, NULL, FALSE);
-    }
-    g_internal_update = FALSE;
-}
-
-static void inject_key(WORD key, BOOL up) {
-    INPUT input;
-    ZeroMemory(&input, sizeof(input));
-    input.type = INPUT_KEYBOARD;
-    input.ki.wVk = key;
-    input.ki.dwFlags = up ? KEYEVENTF_KEYUP : 0;
-    SendInput(1, &input, sizeof(input));
-}
-
-static void copy_active_selection(ViewState *view) {
-    SelectedPair *pair = active_pair(view);
-    void *editor;
-    HWND window;
-    HWND old_focus;
-    int start;
-    int end;
-    int index;
-    if (!pair || view->copy_in_progress) return;
-    start = view->selection_anchor;
-    end = view->caret_column;
-    if (start > end) {
-        int temporary = start;
-        start = end;
-        end = temporary;
-    }
-    start = clamp_column(pair, view->active_side, start);
-    end = clamp_column(pair, view->active_side, end);
-    if (start == end) return;
-    sync_upper_to_caret(view);
-    editor = bc3_frame_detail_editor(view->frame, view->active_side);
-    window = editor_paint_window(editor);
-    if (!window) return;
-    old_focus = GetFocus();
-    KillTimer(view->overlay, COPY_REFOCUS_TIMER);
-    view->copy_restore_focus =
-        old_focus && IsWindow(old_focus) ? old_focus : view->overlay;
-    SetFocus(window);
-    view->copy_in_progress = TRUE;
-    /* BC3's editor checks the real input queue rather than only WM_KEYDOWN.
-       Release modifiers inherited from the invoking shortcut, build the
-       native selection, copy it, then restore focus from a short timer. */
-    inject_key(VK_CONTROL, TRUE);
-    inject_key(VK_SHIFT, TRUE);
-    inject_key(VK_MENU, TRUE);
-    if (start == 0 && end == pair->text_length[view->active_side]) {
-        inject_key(VK_CONTROL, FALSE);
-        inject_key('A', FALSE);
-        inject_key('A', TRUE);
-        inject_key('C', FALSE);
-        inject_key('C', TRUE);
-        inject_key(VK_CONTROL, TRUE);
-        SetTimer(view->overlay, COPY_REFOCUS_TIMER, 30, NULL);
-        return;
-    }
-    if (start > 0) {
-        g_bc3.set_caret_x(editor, start - 1);
-        inject_key(VK_RIGHT, FALSE);
-        inject_key(VK_RIGHT, TRUE);
-    } else {
-        g_bc3.set_caret_x(editor, 0);
-        inject_key(VK_HOME, FALSE);
-        inject_key(VK_HOME, TRUE);
-    }
-    inject_key(VK_SHIFT, FALSE);
-    for (index = start; index < end; ++index) {
-        inject_key(VK_RIGHT, FALSE);
-        inject_key(VK_RIGHT, TRUE);
-    }
-    inject_key(VK_SHIFT, TRUE);
-    inject_key(VK_CONTROL, FALSE);
-    inject_key('C', FALSE);
-    inject_key('C', TRUE);
-    inject_key(VK_CONTROL, TRUE);
-    SetTimer(view->overlay, COPY_REFOCUS_TIMER, 30, NULL);
-}
-
-static BOOL ensure_overlay(ViewState *view) {
-    RECT rect;
     if (!view || !view->frame) return FALSE;
     view->panel_object = bc3_frame_details_panel(view->frame);
-    if (!view->panel_object) return FALSE;
+    detail = bc3_frame_detail_editor(view->frame, 0);
+    if (!view->panel_object || !detail) return FALSE;
     if (!view->initial_panel_height) {
         view->initial_panel_height =
             *(int *)((uint8_t *)view->panel_object + 0x4c);
     }
-    if (!view->panel_window || !IsWindow(view->panel_window)) {
-        view->panel_window = bc3_find_control_window(view->panel_object);
-    }
-    if (!view->panel_window) return FALSE;
-    GetClientRect(view->panel_window, &rect);
-    if (!view->overlay || !IsWindow(view->overlay)) {
-        view->overlay = CreateWindowExW(
-            0, OVERLAY_CLASS, L"", WS_CHILD | WS_VISIBLE | WS_VSCROLL |
-            WS_TABSTOP | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
-            0, 0, rect.right, rect.bottom,
-            view->panel_window, NULL, g_instance, view);
-        if (!view->overlay) {
-            log_line("CreateWindow overlay failed: %lu", GetLastError());
-            return FALSE;
+    for (side = 0; side < MAX_EDITOR_SIDES; ++side) {
+        void *editor = bc3_frame_detail_editor(view->frame, side);
+        if (editor && !view->base_detail_height[side]) {
+            view->base_detail_height[side] =
+                *(int *)((uint8_t *)editor + 0x4c);
         }
-        SetWindowLongPtrW(view->overlay, GWLP_USERDATA, (LONG_PTR)view);
-        view->horizontal_scroll = CreateWindowExW(
-            0, L"SCROLLBAR", L"", WS_CHILD | WS_VISIBLE | SBS_HORZ,
-            0, rect.bottom - SCROLLBAR_HEIGHT, rect.right, SCROLLBAR_HEIGHT,
-            view->overlay, (HMENU)1, g_instance, NULL);
-    }
-    SetWindowPos(view->overlay, HWND_TOP, 0, 0, rect.right, rect.bottom,
-                 SWP_SHOWWINDOW);
-    ensure_marker_windows(view);
-    return TRUE;
-}
-
-static BOOL capture_editor(HWND window, TempSurface *surface) {
-    RECT rect;
-    HBRUSH brush;
-    if (!window || !GetClientRect(window, &rect)) return FALSE;
-    if (!surface_create(surface, rect.right, rect.bottom)) return FALSE;
-    brush = CreateSolidBrush(GetSysColor(COLOR_WINDOW));
-    FillRect(surface->dc, &rect, brush);
-    DeleteObject(brush);
-    SendMessageW(window, WM_PRINTCLIENT, (WPARAM)surface->dc,
-                 PRF_CLIENT | PRF_ERASEBKGND | PRF_CHILDREN);
-    return TRUE;
-}
-
-static int editor_cell_width(HWND window) {
-    HDC dc;
-    HFONT font;
-    HGDIOBJ previous = NULL;
-    SIZE size;
-    int width = 0;
-    if (!window) return 0;
-    dc = GetDC(window);
-    if (!dc) return 0;
-    font = (HFONT)SendMessageW(window, WM_GETFONT, 0, 0);
-    if (font) previous = SelectObject(dc, font);
-    if (GetTextExtentPoint32W(dc, L"M", 1, &size)) width = size.cx;
-    if (previous) SelectObject(dc, previous);
-    ReleaseDC(window, dc);
-    return width;
-}
-
-static int surface_horizontal_shift(const TempSurface *before,
-                                    const TempSurface *after,
-                                    int max_shift) {
-    const uint32_t *before_pixels;
-    const uint32_t *after_pixels;
-    int best_shift = 0;
-    int best_score = 0x7fffffff;
-    int shift;
-    if (!before->bits || !after->bits || before->width != after->width ||
-        before->height != after->height) {
-        return 0;
-    }
-    if (before->width / 2 < max_shift) {
-        max_shift = before->width / 2;
-    }
-    if (max_shift < 1) return 0;
-    before_pixels = (const uint32_t *)before->bits;
-    after_pixels = (const uint32_t *)after->bits;
-    for (shift = 1; shift <= max_shift; ++shift) {
-        int score = 0;
-        int y;
-        for (y = 0; y < before->height; ++y) {
-            int x;
-            int row = y * before->width;
-            for (x = FIXED_GUTTER_WIDTH + 2;
-                 x < before->width - max_shift; ++x) {
-                if ((before_pixels[row + x + shift] & 0x00ffffffu) !=
-                    (after_pixels[row + x] & 0x00ffffffu)) {
-                    ++score;
-                }
+        if (editor && !view->base_single_row_captured[side]) {
+            void *core = *(void **)((uint8_t *)editor + 0x280);
+            if (core) {
+                view->base_single_row[side] =
+                    *(BYTE *)((uint8_t *)core + 0x284 +
+                              EDITOR_OPTION_SINGLE_ROW);
+                view->base_single_row_captured[side] = TRUE;
+                view->base_selection[side] =
+                    *(BYTE *)((uint8_t *)core + 0x284 +
+                              EDITOR_OPTION_SELECTION);
+                view->base_selection_captured[side] = TRUE;
             }
         }
-        if (score < best_score) {
-            best_score = score;
-            best_shift = shift;
+    }
+    if (!view->original_source) {
+        view->original_source = bc3_editor_data_source(detail);
+        view->original_item_count = bc3_editor_item_count(detail);
+        initialize_proxy_vtable(view->original_source);
+        if (view->original_source && g_source_vtable_ready) {
+            view->proxy.vtable = g_source_proxy_vtable;
+            view->proxy.owner =
+                *(void **)((uint8_t *)view->original_source + 4);
         }
     }
-    return best_shift;
+    ensure_message_window(view);
+    ensure_window_hooks(view);
+    return view->original_source && view->message_window &&
+           g_source_vtable_ready;
 }
 
-static int measure_editor_cell_width(void *left_editor, void *right_editor,
-                                     HWND left_window, HWND right_window,
-                                     int left_max_scroll,
-                                     int right_max_scroll) {
-    void *measured_editor;
-    HWND measured_window;
-    TempSurface before;
-    TempSurface after;
-    int measured_max_scroll;
-    int column_delta;
-    int pixel_shift;
-    int old_left_x;
-    int old_right_x;
-    int width = 0;
-    if (left_max_scroll > 0) {
-        measured_editor = left_editor;
-        measured_window = left_window;
-        measured_max_scroll = left_max_scroll;
-    } else if (right_max_scroll > 0) {
-        measured_editor = right_editor;
-        measured_window = right_window;
-        measured_max_scroll = right_max_scroll;
-    } else {
-        return 0;
-    }
-    old_left_x = g_bc3.get_left_x(left_editor);
-    old_right_x = g_bc3.get_left_x(right_editor);
-    g_bc3.set_left_x(left_editor, 0);
-    g_bc3.set_left_x(right_editor, 0);
-    if (!capture_editor(measured_window, &before)) goto restore;
-    column_delta = measured_max_scroll < 16 ? measured_max_scroll : 16;
-    if (left_max_scroll > 0) {
-        g_bc3.set_left_x(left_editor,
-                         left_max_scroll < column_delta
-                             ? left_max_scroll : column_delta);
-    }
-    if (right_max_scroll > 0) {
-        g_bc3.set_left_x(right_editor,
-                         right_max_scroll < column_delta
-                             ? right_max_scroll : column_delta);
-    }
-    if (g_bc3.get_left_x(measured_editor) != column_delta ||
-        !capture_editor(measured_window, &after)) {
-        surface_destroy(&before);
-        goto restore;
-    }
-    pixel_shift = surface_horizontal_shift(&before, &after,
-                                           before.width / 2);
-    if (pixel_shift > 0) {
-        width = (pixel_shift + column_delta / 2) / column_delta;
-    }
-    surface_destroy(&before);
-    surface_destroy(&after);
-
-restore:
-    g_bc3.set_left_x(left_editor, old_left_x);
-    g_bc3.set_left_x(right_editor, old_right_x);
-    return width;
-}
-
-static BOOL capture_current_pair(ViewState *view, SelectedPair *pair) {
-    void *left_editor = bc3_frame_detail_editor(view->frame, 0);
-    void *right_editor = bc3_frame_detail_editor(view->frame, 1);
-    HWND left_window = editor_paint_window(left_editor);
-    HWND right_window = editor_paint_window(right_editor);
-    RECT left_rect;
-    RECT right_rect;
-    int old_left_x;
-    int old_right_x;
-    int left_x_count;
-    int right_x_count;
-    int left_max_scroll;
-    int right_max_scroll;
-    int max_scroll;
-    int visible_columns;
-    int cell_width;
-    int content_width;
-    int viewport;
-    int offset;
-    BOOL ok = FALSE;
-
-    if (!left_editor || !right_editor || !left_window || !right_window ||
-        !GetClientRect(left_window, &left_rect) ||
-        !GetClientRect(right_window, &right_rect)) {
-        log_line("Detail editor HWND discovery failed");
-        return FALSE;
-    }
-    left_x_count = g_bc3.get_x_count(left_editor);
-    right_x_count = g_bc3.get_x_count(right_editor);
-    left_max_scroll = g_bc3.get_max_left_x(left_editor);
-    right_max_scroll = g_bc3.get_max_left_x(right_editor);
-    max_scroll = left_max_scroll > right_max_scroll
-                     ? left_max_scroll : right_max_scroll;
-    viewport = left_rect.right - FIXED_GUTTER_WIDTH;
-    if (viewport < 32) return FALSE;
-    if (max_scroll < 0) max_scroll = 0;
-    if (right_x_count > left_x_count) {
-        visible_columns = right_x_count - right_max_scroll;
-    } else {
-        visible_columns = left_x_count - left_max_scroll;
-    }
-    if (visible_columns < 1) visible_columns = 1;
-    cell_width = measure_editor_cell_width(
-        left_editor, right_editor, left_window, right_window,
-        left_max_scroll, right_max_scroll);
-    if (cell_width < 1 || cell_width > 64) {
-        cell_width = editor_cell_width(left_window);
-    }
-    if (cell_width < 1 || cell_width > 64) {
-        cell_width = (viewport + visible_columns - 1) / visible_columns;
-        if (cell_width < 1) cell_width = 1;
-    }
-    pair->cell_width = cell_width;
-    /* BC3 exposes the final character coordinate, not a character count. */
-    pair->text_length[0] = left_x_count + 1;
-    pair->text_length[1] = right_x_count + 1;
-    content_width = viewport + max_scroll * cell_width;
-    if (content_width > MAX_CAPTURE_WIDTH) content_width = MAX_CAPTURE_WIDTH;
-    if (!strip_create(&pair->left, FIXED_GUTTER_WIDTH + content_width,
-                      left_rect.bottom) ||
-        !strip_create(&pair->right, FIXED_GUTTER_WIDTH + content_width,
-                      right_rect.bottom)) {
-        return FALSE;
-    }
-
-    old_left_x = g_bc3.get_left_x(left_editor);
-    old_right_x = g_bc3.get_left_x(right_editor);
-    for (offset = 0; offset < content_width;) {
-        TempSurface left_capture;
-        TempSurface right_capture;
-        int scroll_position = offset / cell_width;
-        int left_source_x;
-        int right_source_x;
-        int left_available;
-        int right_available;
-        int left_copy_width;
-        int right_copy_width;
-        int copy_width;
-        if (scroll_position > max_scroll) scroll_position = max_scroll;
-        g_bc3.set_left_x(left_editor, scroll_position);
-        g_bc3.set_left_x(right_editor, scroll_position);
-        left_source_x = FIXED_GUTTER_WIDTH + offset -
-                        g_bc3.get_left_x(left_editor) * cell_width;
-        right_source_x = FIXED_GUTTER_WIDTH + offset -
-                         g_bc3.get_left_x(right_editor) * cell_width;
-        if (!capture_editor(left_window, &left_capture)) break;
-        if (!capture_editor(right_window, &right_capture)) {
-            surface_destroy(&left_capture);
-            break;
+static int selection_index(const ViewState *view, int key) {
+    int index;
+    for (index = 0; index < view->selection_count; ++index) {
+        if (view->selections[index].first <= key &&
+            key <= view->selections[index].last) {
+            return index;
         }
-        /* The editors scroll in whole character cells.  When viewport width
-           is not a multiple of cell_width, the source coordinates are a few
-           pixels past the gutter.  Copy only the pixels that actually remain
-           in both captured DIBs; a full viewport would overrun later pages. */
-        left_available = left_capture.width - left_source_x;
-        right_available = right_capture.width - right_source_x;
-        if (left_available < 0) left_available = 0;
-        if (right_available < 0) right_available = 0;
-        if (left_available > 0 && right_available > 0) {
-            copy_width = left_available < right_available
-                             ? left_available : right_available;
+    }
+    return -1;
+}
+
+static void remove_selection(ViewState *view, int index) {
+    if (index < 0 || index >= view->selection_count) return;
+    if (index + 1 < view->selection_count) {
+        memmove(&view->selections[index], &view->selections[index + 1],
+                (size_t)(view->selection_count - index - 1) *
+                    sizeof(view->selections[0]));
+    }
+    --view->selection_count;
+}
+
+static int compare_selection(const void *left, const void *right) {
+    const SelectedRange *a = (const SelectedRange *)left;
+    const SelectedRange *b = (const SelectedRange *)right;
+    return (a->first > b->first) - (a->first < b->first);
+}
+
+static void normalize_selections(ViewState *view) {
+    int read_index;
+    int write_index = 0;
+    if (view->selection_count <= 1) return;
+    qsort(view->selections, (size_t)view->selection_count,
+          sizeof(view->selections[0]), compare_selection);
+    for (read_index = 0; read_index < view->selection_count; ++read_index) {
+        SelectedRange current = view->selections[read_index];
+        if (write_index > 0 &&
+            current.first <= view->selections[write_index - 1].last + 1) {
+            if (current.last > view->selections[write_index - 1].last)
+                view->selections[write_index - 1].last = current.last;
+            if (current.key == view->active_key)
+                view->selections[write_index - 1].key = current.key;
         } else {
-            copy_width = left_available > right_available
-                             ? left_available : right_available;
+            view->selections[write_index++] = current;
         }
-        if (content_width - offset < copy_width) {
-            copy_width = content_width - offset;
-        }
-        if (copy_width <= 0) {
-            surface_destroy(&left_capture);
-            surface_destroy(&right_capture);
-            break;
-        }
-        if (offset == 0) {
-            BitBlt(pair->left.dc, 0, 0, FIXED_GUTTER_WIDTH,
-                   pair->left.height, left_capture.dc, 0, 0, SRCCOPY);
-            BitBlt(pair->right.dc, 0, 0, FIXED_GUTTER_WIDTH,
-                   pair->right.height, right_capture.dc, 0, 0, SRCCOPY);
-        }
-        left_copy_width = left_available < copy_width
-                              ? left_available : copy_width;
-        right_copy_width = right_available < copy_width
-                               ? right_available : copy_width;
-        if (left_copy_width > 0) {
-            BitBlt(pair->left.dc, FIXED_GUTTER_WIDTH + offset, 0,
-                   left_copy_width, pair->left.height, left_capture.dc,
-                   left_source_x, 0, SRCCOPY);
-        }
-        if (right_copy_width > 0) {
-            BitBlt(pair->right.dc, FIXED_GUTTER_WIDTH + offset, 0,
-                   right_copy_width, pair->right.height, right_capture.dc,
-                   right_source_x, 0, SRCCOPY);
-        }
-        surface_destroy(&left_capture);
-        surface_destroy(&right_capture);
-        ok = TRUE;
-        offset += copy_width;
     }
-    g_bc3.set_left_x(left_editor, old_left_x);
-    g_bc3.set_left_x(right_editor, old_right_x);
-    InvalidateRect(left_window, NULL, TRUE);
-    InvalidateRect(right_window, NULL, TRUE);
-    return ok;
+    view->selection_count = write_index;
 }
 
-static void read_editor_items(ViewState *view, SelectedPair *pair) {
+static void add_selection(ViewState *view, int key, int first, int last) {
+    SelectedRange *selection;
+    if (view->selection_count >= MAX_SELECTIONS) return;
+    selection = &view->selections[view->selection_count++];
+    selection->key = key;
+    selection->first = first;
+    selection->last = last;
+    normalize_selections(view);
+}
+
+static void invalidate_native_editors(ViewState *view) {
     int side;
     for (side = 0; side < MAX_EDITOR_SIDES; ++side) {
-        void *editor = bc3_frame_main_editor(view->frame, side);
-        pair->item[side] = editor ? g_bc3.get_cur_item(editor) : -1;
+        void *editor = bc3_frame_detail_editor(view->frame, side);
+        HWND outer = editor ? bc3_find_control_window(editor) : NULL;
+        if (outer) InvalidateRect(outer, NULL, TRUE);
     }
-}
-
-static BOOL add_current_pair(ViewState *view, int key) {
-    SelectedPair *pair;
-    if (pair_index(view, key) >= 0 || view->pair_count >= MAX_SELECTIONS) {
-        return pair_index(view, key) >= 0;
-    }
-    pair = &view->pairs[view->pair_count];
-    ZeroMemory(pair, sizeof(*pair));
-    pair->key = key;
-    read_editor_items(view, pair);
-    if (!capture_current_pair(view, pair)) {
-        strip_destroy(&pair->left);
-        strip_destroy(&pair->right);
-        ZeroMemory(pair, sizeof(*pair));
-        return FALSE;
-    }
-    ++view->pair_count;
-    qsort(view->pairs, (size_t)view->pair_count, sizeof(view->pairs[0]),
-          pair_compare);
-    return TRUE;
-}
-
-static void update_scrollbars(ViewState *view) {
-    RECT client;
-    SCROLLINFO info;
-    int index;
-    int maximum_width = 0;
-    int total_height = HEADER_HEIGHT + SCROLLBAR_HEIGHT + 2;
-    int page_height;
-
-    if (!view->overlay || !GetClientRect(view->overlay, &client)) return;
-    for (index = 0; index < view->pair_count; ++index) {
-        int width = view->pairs[index].left.width;
-        int pair_height = CAPTION_HEIGHT + view->pairs[index].left.height +
-                          view->pairs[index].right.height + 3;
-        if (view->pairs[index].right.width > width)
-            width = view->pairs[index].right.width;
-        if (width > maximum_width) maximum_width = width;
-        total_height += pair_height;
-    }
-    ZeroMemory(&info, sizeof(info));
-    info.cbSize = sizeof(info);
-    info.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
-    info.nMin = 0;
-    info.nMax = maximum_width > FIXED_GUTTER_WIDTH
-                    ? maximum_width - FIXED_GUTTER_WIDTH - 1
-                    : 0;
-    info.nPage = client.right > FIXED_GUTTER_WIDTH
-                     ? (UINT)(client.right - FIXED_GUTTER_WIDTH)
-                     : 1;
-    info.nPos = view->horizontal_offset;
-    SetScrollInfo(view->horizontal_scroll, SB_CTL, &info, TRUE);
-    view->horizontal_offset = GetScrollPos(view->horizontal_scroll, SB_CTL);
-
-    page_height = client.bottom - HEADER_HEIGHT - SCROLLBAR_HEIGHT;
-    ZeroMemory(&info, sizeof(info));
-    info.cbSize = sizeof(info);
-    info.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
-    info.nMin = 0;
-    info.nMax = total_height - HEADER_HEIGHT - SCROLLBAR_HEIGHT;
-    info.nPage = page_height > 0 ? (UINT)page_height : 1;
-    info.nPos = view->vertical_offset;
-    SetScrollInfo(view->overlay, SB_VERT, &info, TRUE);
-    view->vertical_offset = GetScrollPos(view->overlay, SB_VERT);
-}
-
-static void resize_panel_for_selection(ViewState *view) {
-    int index;
-    int desired = HEADER_HEIGHT + SCROLLBAR_HEIGHT + 4;
-    int maximum = 360;
-    if (!view->panel_object || !view->initial_panel_height) return;
-    for (index = 0; index < view->pair_count; ++index) {
-        desired += CAPTION_HEIGHT + view->pairs[index].left.height +
-                   view->pairs[index].right.height + 3;
-    }
-    if (view->pair_count == 0) desired = view->initial_panel_height;
-    if (desired > maximum) desired = maximum;
-    if (desired < view->initial_panel_height) desired = view->initial_panel_height;
-    if (*(int *)((uint8_t *)view->panel_object + 0x4c) != desired) {
-        g_internal_update = TRUE;
-        g_bc3.set_control_height(view->panel_object, desired);
-        g_internal_update = FALSE;
-    }
-}
-
-static void refresh_view(ViewState *view) {
-    int side;
-    if (!ensure_overlay(view)) return;
-    resize_panel_for_selection(view);
-    ensure_overlay(view);
-    update_scrollbars(view);
-    InvalidateRect(view->overlay, NULL, TRUE);
     for (side = 0; side < 2; ++side) {
         if (view->marker_window[side])
             InvalidateRect(view->marker_window[side], NULL, FALSE);
     }
-    update_overlay_caret(view);
 }
 
-static void restore_main_editors(ViewState *view, int items[4], int tops[4]) {
+static void update_native_layout(ViewState *view, BOOL reset) {
     int side;
-    for (side = 0; side < MAX_EDITOR_SIDES; ++side) {
-        void *editor = bc3_frame_main_editor(view->frame, side);
-        if (!editor) continue;
-        if (items[side] >= 0) g_bc3.set_cur_item(editor, items[side]);
-        if (tops[side] >= 0) g_bc3.set_top_item(editor, tops[side]);
-        {
-            HWND window = bc3_find_control_window(editor);
-            if (window) {
-                SendMessageW(window, WM_SETREDRAW, TRUE, 0);
-                InvalidateRect(window, NULL, FALSE);
-            }
-        }
-    }
-}
-
-static void save_main_editors(ViewState *view, int items[4], int tops[4]) {
-    int side;
-    for (side = 0; side < MAX_EDITOR_SIDES; ++side) {
-        void *editor = bc3_frame_main_editor(view->frame, side);
-        HWND window;
-        items[side] = editor ? g_bc3.get_cur_item(editor) : -1;
-        tops[side] = editor ? g_bc3.get_top_item(editor) : -1;
-        window = editor ? bc3_find_control_window(editor) : NULL;
-        if (window) SendMessageW(window, WM_SETREDRAW, FALSE, 0);
-    }
-}
-
-static void select_range(ViewState *view, int start, int end, BOOL append) {
-    void *driver = bc3_frame_main_editor(view->frame, 0);
-    int saved_items[4];
-    int saved_tops[4];
-    int direction = start <= end ? 1 : -1;
-    int key;
-    if (!driver) return;
-    if (!append) pairs_clear(view);
-    save_main_editors(view, saved_items, saved_tops);
+    int rows = reset ? 1 : view->proxy.count;
+    int visible_rows;
+    int desired = 3;
+    int active_count = 0;
+    if (!view->panel_object) return;
+    if (rows < 1) rows = 1;
+    visible_rows = rows > MAX_VISIBLE_ROWS ? MAX_VISIBLE_ROWS : rows;
     g_internal_update = TRUE;
-    for (key = start;; key += direction) {
-        g_bc3.set_cur_item(driver, key);
-        add_current_pair(view, key);
-        if (key == end || view->pair_count >= MAX_SELECTIONS) break;
+    for (side = 0; side < 2; ++side) {
+        void *editor = bc3_frame_detail_editor(view->frame, side);
+        int base = view->base_detail_height[side];
+        int height;
+        if (!editor || base <= 0) continue;
+        height = reset ? base : base * visible_rows;
+        g_bc3.set_control_height(editor, height);
+        desired += height + 1;
+        ++active_count;
     }
-    restore_main_editors(view, saved_items, saved_tops);
+    if (active_count == 0) desired = view->initial_panel_height;
+    if (desired < view->initial_panel_height)
+        desired = view->initial_panel_height;
+    if (desired > MAX_PANEL_HEIGHT) {
+        int each = (MAX_PANEL_HEIGHT - 3 - active_count) /
+                   (active_count ? active_count : 1);
+        for (side = 0; side < 2; ++side) {
+            void *editor = bc3_frame_detail_editor(view->frame, side);
+            if (editor && view->base_detail_height[side] > 0)
+                g_bc3.set_control_height(editor, each);
+        }
+        desired = MAX_PANEL_HEIGHT;
+    }
+    if (*(int *)((uint8_t *)view->panel_object + 0x4c) != desired)
+        g_bc3.set_control_height(view->panel_object, desired);
     g_internal_update = FALSE;
 }
 
-static void apply_selection(ViewState *view, int key, BOOL control,
-                            BOOL shift) {
-    int index;
-    if (!view || key < 0) return;
-    if (control && shift && view->anchor >= 0) {
-        select_range(view, view->anchor, key, TRUE);
-    } else if (control) {
-        index = pair_index(view, key);
-        if (index >= 0) {
-            pair_remove(view, index);
-        } else {
-            add_current_pair(view, key);
+static void restore_original_source(ViewState *view) {
+    int side;
+    if (!view || !view->proxy_active || !view->original_source) return;
+    view->syncing = TRUE;
+    for (side = 0; side < MAX_EDITOR_SIDES; ++side) {
+        void *editor = bc3_frame_detail_editor(view->frame, side);
+        int proxy_item;
+        int original_item = 0;
+        int left_x;
+        if (!editor) continue;
+        proxy_item = g_bc3.get_cur_item(editor);
+        if (proxy_item >= 0 && proxy_item < view->proxy.count)
+            original_item = view->proxy.map[proxy_item];
+        left_x = g_bc3.get_left_x(editor);
+        log_line("Restoring native detail side %d source", side);
+        g_bc3.set_data_source(editor, view->original_source);
+        if (view->base_single_row_captured[side]) {
+            g_bc3.set_option(editor, EDITOR_OPTION_SINGLE_ROW,
+                             view->base_single_row[side] != 0);
         }
-        view->anchor = key;
-    } else if (shift && view->anchor >= 0) {
-        select_range(view, view->anchor, key, FALSE);
-    } else {
-        pairs_clear(view);
-        add_current_pair(view, key);
-        view->anchor = key;
+        if (view->base_selection_captured[side]) {
+            g_bc3.set_option(editor, EDITOR_OPTION_SELECTION,
+                             view->base_selection[side] != 0);
+        }
+        log_line("Native detail side %d source restored", side);
+        if (original_item < bc3_editor_item_count(editor))
+            g_bc3.set_cur_item(editor, original_item);
+        g_bc3.set_left_x(editor, left_x);
     }
-    refresh_view(view);
+    view->proxy_active = FALSE;
+    view->syncing = FALSE;
+}
+
+static int build_proxy_map(ViewState *view) {
+    int selection_index_value;
+    int count = 0;
+    for (selection_index_value = 0;
+         selection_index_value < view->selection_count;
+         ++selection_index_value) {
+        int item;
+        SelectedRange *selection =
+            &view->selections[selection_index_value];
+        for (item = selection->first; item <= selection->last; ++item) {
+            if (count >= MAX_PROXY_ITEMS) {
+                log_line("Native selected-row view capped at %d internal items",
+                         MAX_PROXY_ITEMS);
+                return count;
+            }
+            view->proxy.map[count++] = item;
+        }
+    }
+    return count;
+}
+
+static int proxy_index_for_original(const ViewState *view, int item) {
+    int index;
+    for (index = 0; index < view->proxy.count; ++index) {
+        if (view->proxy.map[index] == item) return index;
+    }
+    return 0;
+}
+
+static void apply_proxy_source(ViewState *view) {
+    int side;
+    int active_proxy_item;
+    int shared_left_x = 0;
+    if (!ensure_view(view)) return;
+    view->proxy.count = build_proxy_map(view);
+    log_line("Applying native selected-row source: %d item(s)",
+             view->proxy.count);
+    if (view->proxy.count <= 0) {
+        restore_original_source(view);
+        update_native_layout(view, TRUE);
+        invalidate_native_editors(view);
+        return;
+    }
+    active_proxy_item = proxy_index_for_original(view, view->active_key);
+    view->syncing = TRUE;
+    for (side = 0; side < MAX_EDITOR_SIDES; ++side) {
+        void *editor = bc3_frame_detail_editor(view->frame, side);
+        if (!editor) continue;
+        if (side == 0) shared_left_x = g_bc3.get_left_x(editor);
+        log_line("Binding native detail side %d", side);
+        g_bc3.set_option(editor, EDITOR_OPTION_SELECTION, TRUE);
+        g_bc3.set_option(editor, EDITOR_OPTION_SINGLE_ROW, FALSE);
+        /* SetDataSource clears TUiEditorWindow's cached item/scroll bounds
+           and asks the proxy for its new count.  A raw pointer/count write
+           leaves max-top and visible-range caches stale, which asserts as
+           soon as the user clicks proxy row 1 or later.  Detach first
+           because the proxy address itself is stable while its map changes. */
+        g_bc3.set_data_source(editor, NULL);
+        g_bc3.set_data_source(editor, &view->proxy);
+        log_line("Native detail side %d source rebound", side);
+        bc3_editor_override_current_item(editor, active_proxy_item);
+        log_line("Native detail side %d current item set", side);
+        bc3_editor_override_top_item(editor, 0);
+        log_line("Native detail side %d top item set", side);
+    }
+    view->proxy_active = TRUE;
+    update_native_layout(view, FALSE);
+    for (side = 0; side < MAX_EDITOR_SIDES; ++side) {
+        void *editor = bc3_frame_detail_editor(view->frame, side);
+        if (editor) g_bc3.set_left_x(editor, shared_left_x);
+    }
+    view->syncing = FALSE;
+    invalidate_native_editors(view);
+    log_line("Native selected-row view active: %d selection(s), %d internal item(s)",
+             view->selection_count, view->proxy.count);
+}
+
+static void apply_selection_result(ViewState *view, SelectionWork *work) {
+    BOOL control;
+    BOOL shift;
+    int index;
+    int first;
+    int last;
+    if (!view || !work || work->sequence <= view->last_applied_sequence)
+        return;
+    view->last_applied_sequence = work->sequence;
+    log_line("Applying click selection key=%d flags=%d sequence=%ld",
+             work->key, work->flags, (long)work->sequence);
+    first = work->first;
+    last = work->last;
+    if (first > last) {
+        int temporary = first;
+        first = last;
+        last = temporary;
+    }
+    if (first < 0 || last >= work->source_count ||
+        last - first > 32 || work->key < first || work->key > last) {
+        first = work->key;
+        last = work->key;
+    }
+    control = (work->flags & SELECTION_CONTROL) != 0;
+    shift = (work->flags & SELECTION_SHIFT) != 0;
+    if (shift && view->anchor >= 0) {
+        int range_first = view->anchor < first ? view->anchor : first;
+        int range_last = view->anchor > last ? view->anchor : last;
+        if (!control) view->selection_count = 0;
+        add_selection(view, work->key, range_first, range_last);
+    } else if (control) {
+        index = selection_index(view, work->key);
+        if (index >= 0)
+            remove_selection(view, index);
+        else
+            add_selection(view, work->key, first, last);
+    } else {
+        view->selection_count = 0;
+        add_selection(view, work->key, first, last);
+    }
+    view->anchor = work->key;
+    view->active_key = work->key;
+    apply_proxy_source(view);
+}
+
+static void queue_selection(ViewState *view, int key, int flags) {
+    SelectionWork *work;
+    void *model;
+    if (!ensure_view(view)) return;
+    model = bc3_frame_main_editor(view->frame, 0);
+    if (!model) return;
+    work = (SelectionWork *)calloc(1, sizeof(*work));
+    if (!work) return;
+    work->target = view->message_window;
+    work->source_count = bc3_editor_item_count(model);
+    work->key = key;
+    work->flags = flags;
+    work->sequence = InterlockedIncrement(&view->sequence);
+    work->first = key;
+    work->last = key;
+    if (bc3_editor_physical_line_bounds(model, key,
+                                        &work->first, &work->last)) {
+        log_line("Native physical line bounds for item %d: %d..%d", key,
+                 work->first, work->last);
+    }
+    if (!PostMessageW(work->target, WM_MD_APPLY_SELECTION, 0,
+                      (LPARAM)work)) {
+        free(work);
+    }
+}
+
+static void sync_detail_horizontal(ViewState *view, int source_side) {
+    void *source_editor;
+    int left_x;
+    int side;
+    if (!view || view->syncing) return;
+    source_editor = bc3_frame_detail_editor(view->frame, source_side);
+    if (!source_editor) return;
+    left_x = g_bc3.get_left_x(source_editor);
+    view->syncing = TRUE;
+    for (side = 0; side < MAX_EDITOR_SIDES; ++side) {
+        void *editor = bc3_frame_detail_editor(view->frame, side);
+        HWND inner;
+        if (!editor || editor == source_editor) continue;
+        g_bc3.set_left_x(editor, left_x);
+        inner = editor_inner_window(editor);
+        if (inner) InvalidateRect(inner, NULL, FALSE);
+    }
+    view->syncing = FALSE;
+}
+
+static void sync_upper_from_detail(ViewState *view, int detail_side) {
+    void *detail;
+    int proxy_item;
+    int original_item;
+    int side;
+    if (!view || view->syncing || !view->proxy_active) return;
+    detail = bc3_frame_detail_editor(view->frame, detail_side);
+    if (!detail) return;
+    proxy_item = g_bc3.get_cur_item(detail);
+    if (proxy_item < 0 || proxy_item >= view->proxy.count) return;
+    original_item = view->proxy.map[proxy_item];
+    log_line("Native detail item %d maps to original item %d",
+             proxy_item, original_item);
+    view->active_key = original_item;
+    view->syncing = TRUE;
+    for (side = 0; side < MAX_EDITOR_SIDES; ++side) {
+        void *editor = bc3_frame_main_editor(view->frame, side);
+        HWND inner;
+        if (!editor) continue;
+        g_bc3.set_cur_item(editor, original_item);
+        inner = editor_inner_window(editor);
+        if (inner) InvalidateRect(inner, NULL, FALSE);
+    }
+    view->syncing = FALSE;
+    /* Updating the upper current items can move Win32 focus back to a main
+       editor.  Return it to the native detail window that owns the caret so
+       Home/End, drag selection, and Ctrl+C continue in the clicked row. */
+    if (detail_side >= 0 && detail_side < MAX_EDITOR_SIDES &&
+        view->detail_inner[detail_side] &&
+        IsWindow(view->detail_inner[detail_side])) {
+        SetFocus(view->detail_inner[detail_side]);
+    }
 }
 
 BOOL multidetails_initialize(void) {
     WNDCLASSW window_class;
-    NONCLIENTMETRICSW metrics;
     g_instance = (HINSTANCE)GetModuleHandleW(L"version.dll");
     ZeroMemory(&window_class, sizeof(window_class));
-    window_class.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
-    window_class.lpfnWndProc = overlay_window_proc;
+    window_class.lpfnWndProc = message_window_proc;
     window_class.hInstance = g_instance;
-    window_class.hCursor = LoadCursorW(NULL, MAKEINTRESOURCEW(32512));
-    window_class.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
-    window_class.lpszClassName = OVERLAY_CLASS;
-    if (!RegisterClassW(&window_class) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+    window_class.lpszClassName = MESSAGE_CLASS;
+    if (!RegisterClassW(&window_class) &&
+        GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
         return FALSE;
-    }
-    ZeroMemory(&metrics, sizeof(metrics));
-    metrics.cbSize = sizeof(metrics);
-    if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(metrics),
-                              &metrics, 0)) {
-        g_ui_font = CreateFontIndirectW(&metrics.lfMessageFont);
     }
     return TRUE;
 }
@@ -1023,503 +832,266 @@ void multidetails_shutdown(void) {
     for (view_index = 0; view_index < MAX_VIEWS; ++view_index) {
         ViewState *view = &g_views[view_index];
         int side;
-        pairs_clear(view);
-        for (side = 0; side < MAX_EDITOR_SIDES; ++side) {
+        if (!view->frame) continue;
+        restore_original_source(view);
+        for (side = 0; side < 2; ++side) {
             if (view->marker_window[side] && view->marker_original[side] &&
                 IsWindow(view->marker_window[side])) {
                 SetWindowLongPtrW(view->marker_window[side], GWLP_WNDPROC,
                                   (LONG_PTR)view->marker_original[side]);
             }
         }
-        if (view->overlay && IsWindow(view->overlay)) DestroyWindow(view->overlay);
+        for (side = 0; side < MAX_EDITOR_SIDES; ++side) {
+            if (view->detail_inner[side] &&
+                view->detail_inner_original[side] &&
+                IsWindow(view->detail_inner[side])) {
+                SetWindowLongPtrW(view->detail_inner[side], GWLP_WNDPROC,
+                                  (LONG_PTR)view->detail_inner_original[side]);
+            }
+        }
+        if (view->message_window && IsWindow(view->message_window))
+            DestroyWindow(view->message_window);
         ZeroMemory(view, sizeof(*view));
     }
-    if (g_ui_font) DeleteObject(g_ui_font);
-    g_ui_font = NULL;
+    if (g_message_hook) {
+        UnhookWindowsHookEx(g_message_hook);
+        g_message_hook = NULL;
+    }
 }
 
 BOOL multidetails_is_internal_update(void) {
     return g_internal_update;
 }
 
-void multidetails_on_click(void *frame, void *sender) {
+BOOL multidetails_before_click(void *frame, void *sender) {
     ViewState *view;
-    void *driver;
-    int key;
-    LPARAM flags = 0;
-    if (g_internal_update || !frame) return;
+    void *model;
+    SelectionWork work;
+    int side;
+    int flags = 0;
+    if (g_internal_update || !frame) return FALSE;
     view = view_find(frame, TRUE);
-    if (!view || !ensure_overlay(view)) return;
-    view->last_click_sender = sender;
-    driver = bc3_frame_main_editor(frame, 0);
-    if (!driver) return;
-    key = g_bc3.get_cur_item(driver);
-    if (key < 0) return;
-    /* EditorClick has already returned from BC3's original handler, so the
-       native one-line details editors now represent this key. */
-    view->native_sync_key = key;
+    if (!view || !ensure_view(view)) return FALSE;
+    for (side = 0; side < MAX_EDITOR_SIDES; ++side) {
+        if (sender == bc3_frame_detail_editor(frame, side))
+            return FALSE;
+    }
+    model = bc3_frame_main_editor(frame, 0);
+    if (!model || (sender != bc3_frame_main_editor(frame, 0) &&
+                   sender != bc3_frame_main_editor(frame, 1))) {
+        return FALSE;
+    }
+    ZeroMemory(&work, sizeof(work));
+    work.source_count = bc3_editor_item_count(model);
+    work.key = g_bc3.get_cur_item(model);
+    if (work.key < 0 || work.key >= work.source_count) return FALSE;
     if ((GetKeyState(VK_CONTROL) & 0x8000) != 0)
         flags |= SELECTION_CONTROL;
     if ((GetKeyState(VK_SHIFT) & 0x8000) != 0)
         flags |= SELECTION_SHIFT;
-    /* EditorClick runs while BC3 still owns the text-source lock.  Defer the
-       selection/capture work until that callback has completely returned. */
-    PostMessageW(view->overlay, WM_MD_APPLY_SELECTION, (WPARAM)key, flags);
+    work.flags = flags;
+    work.sequence = InterlockedIncrement(&view->sequence);
+    work.first = work.key;
+    work.last = work.key;
+    bc3_editor_physical_line_bounds(model, work.key,
+                                    &work.first, &work.last);
+    log_line("Applying native main click key=%d flags=%d",
+             work.key, flags);
+    apply_selection_result(view, &work);
+    view->suppress_main_click = TRUE;
+    /* The main TUiEditorWindow has already updated its native current row.
+       Skip BC3's original frame-level click handler, whose only relevant
+       work here is rebuilding the one-row detail view that this extension
+       has just replaced with the multi-row native source. */
+    return TRUE;
 }
 
-void multidetails_on_current_changed(void *frame, void *sender) {
-    (void)frame;
-    (void)sender;
-    /* Mouse selection is finalized by EditorClick. Keyboard navigation keeps
-       the stock one-line detail panel until a click establishes a selection. */
+void multidetails_on_click(void *frame, void *sender) {
+    ViewState *view;
+    void *driver;
+    int key;
+    int side;
+    int flags = 0;
+    if (g_internal_update || !frame) return;
+    view = view_find(frame, TRUE);
+    if (!view || !ensure_view(view)) return;
+    for (side = 0; side < MAX_EDITOR_SIDES; ++side) {
+        if (sender == bc3_frame_detail_editor(frame, side)) {
+            log_line("Native detail click on side %d", side);
+            /* The detail window posts synchronization after WM_LBUTTONUP.
+               Waiting preserves BC3's native caret/drag-selection state. */
+            return;
+        }
+    }
+    /* A main-editor mouse click is handled by marker_window_proc after
+       BC3 updates its current item. VCL raises OnClick later for the same
+       gesture; do not apply that gesture twice (the detail editors may
+       already be rebound to the selected-row proxy by then). */
+    if (view->suppress_main_click) {
+        view->suppress_main_click = FALSE;
+        return;
+    }
+    driver = bc3_frame_main_editor(frame, 0);
+    if (!driver) return;
+    key = g_bc3.get_cur_item(driver);
+    if (key < 0) return;
+    log_line("Queued native click key=%d", key);
+    if ((GetKeyState(VK_CONTROL) & 0x8000) != 0)
+        flags |= SELECTION_CONTROL;
+    if ((GetKeyState(VK_SHIFT) & 0x8000) != 0)
+        flags |= SELECTION_SHIFT;
+    queue_selection(view, key, flags);
+}
+
+BOOL multidetails_on_current_changed(void *frame, void *sender) {
+    ViewState *view;
+    int side;
+    int key;
+    int left_length;
+    int right_length;
+    if (!frame || !sender) return FALSE;
+    view = view_find(frame, TRUE);
+    if (!view || !ensure_view(view)) return FALSE;
+    for (side = 0; side < 2; ++side) {
+        if (sender == bc3_frame_main_editor(frame, side)) break;
+    }
+    if (side >= 2) return FALSE;
+    key = g_bc3.get_cur_item(sender);
+    if (key < 0) return FALSE;
+    left_length = bc3_editor_underlying_line_length(sender, key, 0);
+    right_length = bc3_editor_underlying_line_length(sender, key, 1);
+    if (left_length <= 4096 && right_length <= 4096 && !view->syncing)
+        return FALSE;
+    view->syncing = TRUE;
+    for (side = 0; side < 2; ++side) {
+        void *editor = bc3_frame_main_editor(frame, side);
+        HWND inner;
+        if (!editor) continue;
+        bc3_editor_override_current_item(editor, key);
+        inner = editor_inner_window(editor);
+        if (inner) InvalidateRect(inner, NULL, FALSE);
+    }
+    view->syncing = FALSE;
+    log_line("Skipped native single-row CurrentChanged for long item %d",
+             key);
+    return TRUE;
 }
 
 void multidetails_on_details_resize(void *frame) {
     ViewState *view;
     if (g_internal_update || !frame) return;
-    view = view_find(frame, TRUE);
+    view = view_find(frame, FALSE);
     if (!view) return;
-    if (ensure_overlay(view)) {
-        update_scrollbars(view);
-        InvalidateRect(view->overlay, NULL, TRUE);
-    }
+    invalidate_native_editors(view);
 }
 
-static void paint_strip(HDC destination, const CapturedStrip *strip,
-                        int x, int y, int width, int horizontal_offset) {
-    int content_width;
-    int available;
-    if (!strip->dc || strip->height <= 0) return;
-    available = width - FIXED_GUTTER_WIDTH;
-    if (available < 0) available = 0;
-    content_width = strip->width - FIXED_GUTTER_WIDTH - horizontal_offset;
-    if (content_width > available) content_width = available;
-    if (content_width < 0) content_width = 0;
-    BitBlt(destination, x, y, FIXED_GUTTER_WIDTH, strip->height,
-           strip->dc, 0, 0, SRCCOPY);
-    if (content_width > 0) {
-        BitBlt(destination, x + FIXED_GUTTER_WIDTH, y, content_width,
-               strip->height, strip->dc,
-               FIXED_GUTTER_WIDTH + horizontal_offset, 0, SRCCOPY);
-    }
-}
-
-static void paint_detail_selection(ViewState *view, HDC dc,
-                                   SelectedPair *pair, int pair_y,
-                                   const RECT *client) {
-    RECT selection;
-    int start;
-    int end;
-    int cell_width;
-    int strip_top;
-    int strip_height;
-    if (!view || !pair || view->active_key != pair->key ||
-        view->selection_anchor == view->caret_column) return;
-    start = view->selection_anchor;
-    end = view->caret_column;
-    if (start > end) {
-        int temporary = start;
-        start = end;
-        end = temporary;
-    }
-    start = clamp_column(pair, view->active_side, start);
-    end = clamp_column(pair, view->active_side, end);
-    if (start == end) return;
-    cell_width = pair->cell_width > 0 ? pair->cell_width : 1;
-    strip_top = pair_y + CAPTION_HEIGHT;
-    strip_height = pair->left.height;
-    if (view->active_side == 1) {
-        strip_top += pair->left.height;
-        strip_height = pair->right.height;
-    }
-    selection.left = FIXED_GUTTER_WIDTH + start * cell_width -
-                     view->horizontal_offset;
-    selection.right = FIXED_GUTTER_WIDTH + end * cell_width -
-                      view->horizontal_offset;
-    selection.top = strip_top;
-    selection.bottom = strip_top + strip_height;
-    if (selection.left < FIXED_GUTTER_WIDTH)
-        selection.left = FIXED_GUTTER_WIDTH;
-    if (selection.right > client->right)
-        selection.right = client->right;
-    if (selection.top < HEADER_HEIGHT)
-        selection.top = HEADER_HEIGHT;
-    if (selection.bottom > client->bottom - SCROLLBAR_HEIGHT)
-        selection.bottom = client->bottom - SCROLLBAR_HEIGHT;
-    if (selection.right > selection.left &&
-        selection.bottom > selection.top) {
-        InvertRect(dc, &selection);
-    }
-}
-
-static void paint_overlay(ViewState *view, HDC dc, const RECT *client) {
-    HBRUSH face = CreateSolidBrush(GetSysColor(COLOR_BTNFACE));
-    HBRUSH window_brush = CreateSolidBrush(GetSysColor(COLOR_WINDOW));
-    HPEN border_pen = CreatePen(PS_SOLID, 1, GetSysColor(COLOR_3DSHADOW));
-    HFONT previous_font = g_ui_font ? SelectObject(dc, g_ui_font) : NULL;
-    RECT header = {0, 0, client->right, HEADER_HEIGHT};
-    WCHAR text[256];
-    int y = HEADER_HEIGHT - view->vertical_offset;
-    int index;
-    FillRect(dc, client, window_brush);
-    FillRect(dc, &header, face);
-    MoveToEx(dc, 0, HEADER_HEIGHT - 1, NULL);
-    LineTo(dc, client->right, HEADER_HEIGHT - 1);
-    SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, GetSysColor(COLOR_BTNTEXT));
-    _snwprintf(text, 255,
-               L"Text Details  |  %d row%s  |  Click/drag: select text, Ctrl+C: copy  |  Ctrl+click/Shift+click above: rows",
-               view->pair_count, view->pair_count == 1 ? L"" : L"s");
-    TextOutW(dc, 7, 5, text, lstrlenW(text));
-
-    SelectObject(dc, border_pen);
-    for (index = 0; index < view->pair_count; ++index) {
-        SelectedPair *pair = &view->pairs[index];
-        int pair_height = CAPTION_HEIGHT + pair->left.height +
-                          pair->right.height + 3;
-        RECT caption = {0, y, client->right, y + CAPTION_HEIGHT};
-        if (y + pair_height >= HEADER_HEIGHT &&
-            y < client->bottom - SCROLLBAR_HEIGHT) {
-            FillRect(dc, &caption, face);
-            _snwprintf(text, 255, L"Comparison row %d  |  L / R pair",
-                       pair->key + 1);
-            TextOutW(dc, 7, y + 2, text, lstrlenW(text));
-            paint_strip(dc, &pair->left, 0, y + CAPTION_HEIGHT,
-                        client->right, view->horizontal_offset);
-            paint_strip(dc, &pair->right, 0,
-                        y + CAPTION_HEIGHT + pair->left.height,
-                        client->right, view->horizontal_offset);
-            paint_detail_selection(view, dc, pair, y, client);
-            MoveToEx(dc, 0, y + pair_height - 1, NULL);
-            LineTo(dc, client->right, y + pair_height - 1);
-        }
-        y += pair_height;
-    }
-    if (view->pair_count == 0) {
-        const WCHAR *empty = L"No rows selected. Click a comparison row to begin.";
-        TextOutW(dc, 8, HEADER_HEIGHT + 8, empty, lstrlenW(empty));
-    }
-    if (previous_font) SelectObject(dc, previous_font);
-    DeleteObject(border_pen);
-    DeleteObject(face);
-    DeleteObject(window_brush);
-}
-
-static void handle_scroll(ViewState *view, HWND bar, int scroll_bar,
-                          WPARAM wparam) {
-    SCROLLINFO info;
-    int code = LOWORD(wparam);
-    int position;
-    ZeroMemory(&info, sizeof(info));
-    info.cbSize = sizeof(info);
-    info.fMask = SIF_ALL;
-    GetScrollInfo(bar, scroll_bar, &info);
-    position = info.nPos;
-    switch (code) {
-        case SB_LINELEFT: position -= 12; break;
-        case SB_LINERIGHT: position += 12; break;
-        case SB_PAGELEFT: position -= (int)info.nPage; break;
-        case SB_PAGERIGHT: position += (int)info.nPage; break;
-        case SB_THUMBPOSITION:
-        case SB_THUMBTRACK: position = info.nTrackPos; break;
-        case SB_TOP: position = info.nMin; break;
-        case SB_BOTTOM: position = info.nMax; break;
-        default: return;
-    }
-    info.fMask = SIF_POS;
-    info.nPos = position;
-    SetScrollInfo(bar, scroll_bar, &info, TRUE);
-    position = GetScrollPos(bar, scroll_bar);
-    if (scroll_bar == SB_CTL) view->horizontal_offset = position;
-    else view->vertical_offset = position;
-    InvalidateRect(view->overlay, NULL, FALSE);
-    update_overlay_caret(view);
-}
-
-static int column_from_active_x(ViewState *view, int x) {
-    SelectedPair *pair = active_pair(view);
-    int cell_width;
-    int content_x;
-    if (!pair) return 0;
-    cell_width = pair->cell_width > 0 ? pair->cell_width : 1;
-    content_x = view->horizontal_offset + x - FIXED_GUTTER_WIDTH;
-    return clamp_column(pair, view->active_side,
-                        (content_x + cell_width / 2) / cell_width);
-}
-
-static void move_active_caret(ViewState *view, int column,
-                              BOOL extend_selection) {
-    SelectedPair *pair = active_pair(view);
-    if (!pair) return;
-    column = clamp_column(pair, view->active_side, column);
-    if (!extend_selection) view->selection_anchor = column;
-    view->caret_column = column;
-    ensure_bottom_caret_visible(view);
-    sync_upper_to_caret(view);
-    InvalidateRect(view->overlay, NULL, FALSE);
-    update_overlay_caret(view);
-}
-
-static LRESULT CALLBACK overlay_window_proc(HWND window, UINT message,
+static LRESULT CALLBACK message_window_proc(HWND window, UINT message,
                                             WPARAM wparam, LPARAM lparam) {
-    ViewState *view = view_from_overlay(window);
-    switch (message) {
-        case WM_NCCREATE: {
-            CREATESTRUCTW *create = (CREATESTRUCTW *)lparam;
-            SetWindowLongPtrW(window, GWLP_USERDATA,
-                              (LONG_PTR)create->lpCreateParams);
-            return TRUE;
-        }
-        case WM_SIZE:
-            if (view && view->horizontal_scroll) {
-                MoveWindow(view->horizontal_scroll, 0,
-                           HIWORD(lparam) - SCROLLBAR_HEIGHT,
-                           LOWORD(lparam), SCROLLBAR_HEIGHT, TRUE);
-                update_scrollbars(view);
-            }
-            return 0;
-        case WM_GETDLGCODE:
-            return DLGC_WANTARROWS | DLGC_WANTCHARS | DLGC_WANTALLKEYS;
-        case WM_SETFOCUS:
-            if (view) update_overlay_caret(view);
-            return 0;
-        case WM_KILLFOCUS:
-            if (view && view->caret_created) {
-                if (view->caret_visible) HideCaret(window);
-                DestroyCaret();
-                view->caret_created = FALSE;
-                view->caret_visible = FALSE;
-            }
-            return 0;
-        case WM_LBUTTONDOWN:
-            if (view) {
-                SelectedPair *pair = NULL;
-                int side = -1;
-                int column = 0;
-                if (detail_hit_test(view, GET_X_LPARAM(lparam),
-                                    GET_Y_LPARAM(lparam), &pair, &side,
-                                    &column)) {
-                    BOOL extend = (GetKeyState(VK_SHIFT) & 0x8000) != 0 &&
-                                  view->active_key == pair->key &&
-                                  view->active_side == side;
-                    SetFocus(window);
-                    view->active_key = pair->key;
-                    view->active_side = side;
-                    if (!extend) view->selection_anchor = column;
-                    view->caret_column = column;
-                    view->selecting = TRUE;
-                    SetCapture(window);
-                    sync_upper_to_caret(view);
-                    InvalidateRect(window, NULL, FALSE);
-                    update_overlay_caret(view);
-                }
-            }
-            return 0;
-        case WM_MOUSEMOVE:
-            if (view && view->selecting && GetCapture() == window &&
-                (wparam & MK_LBUTTON)) {
-                view->caret_column = column_from_active_x(
-                    view, GET_X_LPARAM(lparam));
-                ensure_bottom_caret_visible(view);
-                sync_upper_to_caret(view);
-                InvalidateRect(window, NULL, FALSE);
-                update_overlay_caret(view);
-            }
-            return 0;
-        case WM_LBUTTONUP:
-            if (view && view->selecting) {
-                view->caret_column = column_from_active_x(
-                    view, GET_X_LPARAM(lparam));
-                view->selecting = FALSE;
-                if (GetCapture() == window) ReleaseCapture();
-                ensure_bottom_caret_visible(view);
-                sync_upper_to_caret(view);
-                InvalidateRect(window, NULL, FALSE);
-                update_overlay_caret(view);
-            }
-            return 0;
-        case WM_CAPTURECHANGED:
-            if (view) view->selecting = FALSE;
-            return 0;
-        case WM_TIMER:
-            if (view && wparam == COPY_REFOCUS_TIMER) {
-                KillTimer(window, COPY_REFOCUS_TIMER);
-                SetFocus(view->copy_restore_focus &&
-                                 IsWindow(view->copy_restore_focus)
-                             ? view->copy_restore_focus : window);
-                view->copy_restore_focus = NULL;
-                view->copy_in_progress = FALSE;
-                update_overlay_caret(view);
-                return 0;
-            }
-            break;
-        case WM_KEYDOWN:
-            if (view && active_pair(view)) {
-                SelectedPair *pair = active_pair(view);
-                BOOL control = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
-                BOOL shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
-                if (control && (wparam == 'C' || wparam == VK_INSERT)) {
-                    copy_active_selection(view);
-                    return 0;
-                }
-                if (control && wparam == 'A') {
-                    view->selection_anchor = 0;
-                    view->caret_column = pair->text_length[view->active_side];
-                    ensure_bottom_caret_visible(view);
-                    sync_upper_to_caret(view);
-                    InvalidateRect(window, NULL, FALSE);
-                    update_overlay_caret(view);
-                    return 0;
-                }
-                switch (wparam) {
-                    case VK_LEFT:
-                        move_active_caret(view, view->caret_column - 1,
-                                          shift);
-                        return 0;
-                    case VK_RIGHT:
-                        move_active_caret(view, view->caret_column + 1,
-                                          shift);
-                        return 0;
-                    case VK_HOME:
-                        move_active_caret(view, 0, shift);
-                        return 0;
-                    case VK_END:
-                        move_active_caret(
-                            view, pair->text_length[view->active_side],
-                            shift);
-                        return 0;
-                    case VK_ESCAPE:
-                        view->selection_anchor = view->caret_column;
-                        InvalidateRect(window, NULL, FALSE);
-                        return 0;
-                }
-            }
-            break;
-        case WM_CHAR:
-            if (view && wparam == 1 && active_pair(view)) {
-                SelectedPair *pair = active_pair(view);
-                view->selection_anchor = 0;
-                view->caret_column =
-                    pair->text_length[view->active_side];
-                ensure_bottom_caret_visible(view);
-                sync_upper_to_caret(view);
-                InvalidateRect(window, NULL, FALSE);
-                update_overlay_caret(view);
-                return 0;
-            }
-            if (view && wparam == 3) {
-                copy_active_selection(view);
-                return 0;
-            }
-            break;
-        case WM_HSCROLL:
-            if (view) handle_scroll(view, (HWND)lparam, SB_CTL, wparam);
-            return 0;
-        case WM_VSCROLL:
-            if (view) handle_scroll(view, window, SB_VERT, wparam);
-            return 0;
-        case WM_MOUSEWHEEL:
-            if (view) {
-                int delta = GET_WHEEL_DELTA_WPARAM(wparam);
-                handle_scroll(view, window, SB_VERT,
-                              MAKEWPARAM(delta > 0 ? SB_LINEUP : SB_LINEDOWN,
-                                         0));
-            }
-            return 0;
-        case WM_MD_APPLY_SELECTION:
-            if (view) {
-                apply_selection(view, (int)wparam,
-                                (lparam & SELECTION_CONTROL) != 0,
-                                (lparam & SELECTION_SHIFT) != 0);
-            }
-            return 0;
-        case WM_PAINT: {
-            PAINTSTRUCT paint;
-            RECT client;
-            HDC dc = BeginPaint(window, &paint);
-            GetClientRect(window, &client);
-            if (view) paint_overlay(view, dc, &client);
-            EndPaint(window, &paint);
-            if (view) update_overlay_caret(view);
-            return 0;
-        }
-        case WM_DESTROY:
-            if (view && view->caret_created) {
-                DestroyCaret();
-                view->caret_created = FALSE;
-                view->caret_visible = FALSE;
-            }
-            return 0;
+    ViewState *view =
+        (ViewState *)GetWindowLongPtrW(window, GWLP_USERDATA);
+    (void)wparam;
+    if (message == WM_NCCREATE) {
+        CREATESTRUCTW *create = (CREATESTRUCTW *)lparam;
+        SetWindowLongPtrW(window, GWLP_USERDATA,
+                          (LONG_PTR)create->lpCreateParams);
+        return TRUE;
     }
+    if (message == WM_MD_APPLY_SELECTION) {
+        SelectionWork *work = (SelectionWork *)lparam;
+        log_line("Native selection message received");
+        if (view && work) apply_selection_result(view, work);
+        free(work);
+        return 0;
+    }
+    if (message == WM_MD_SYNC_DETAIL) {
+        int side = (int)wparam;
+        if (view && side >= 0 && side < MAX_EDITOR_SIDES) {
+            log_line("Synchronizing upper editors from native detail side %d",
+                     side);
+            sync_upper_from_detail(view, side);
+            log_line("Upper editors synchronized from native detail side %d",
+                     side);
+        }
+        return 0;
+    }
+    if (message == WM_NCDESTROY && view)
+        view->message_window = NULL;
     return DefWindowProcW(window, message, wparam, lparam);
-}
-
-static void paint_selection_markers(ViewState *view, int side, HWND window) {
-    HDC dc;
-    RECT client;
-    TEXTMETRICW metrics;
-    HFONT font;
-    HGDIOBJ previous_font = NULL;
-    HPEN pen;
-    HGDIOBJ old_pen;
-    HGDIOBJ old_brush;
-    int line_height = 16;
-    int top_item;
-    int index;
-    if (!view || side < 0 || side >= 2 || !view->marker_editor[side]) return;
-    dc = GetDC(window);
-    if (!dc) return;
-    GetClientRect(window, &client);
-    font = (HFONT)SendMessageW(window, WM_GETFONT, 0, 0);
-    if (font) previous_font = SelectObject(dc, font);
-    if (GetTextMetricsW(dc, &metrics)) {
-        int measured = metrics.tmHeight + metrics.tmExternalLeading + 1;
-        if (measured >= 10 && measured <= 40) line_height = measured;
-    }
-    top_item = g_bc3.get_top_item(view->marker_editor[side]);
-    pen = CreatePen(PS_SOLID, 1, RGB(0, 102, 204));
-    old_pen = SelectObject(dc, pen);
-    old_brush = SelectObject(dc, GetStockObject(HOLLOW_BRUSH));
-    for (index = 0; index < view->pair_count; ++index) {
-        int item = view->pairs[index].item[side];
-        int y;
-        HBRUSH marker;
-        RECT bar;
-        if (item < 0) continue;
-        y = (item - top_item) * line_height;
-        if (y + line_height < 0 || y >= client.bottom) continue;
-        Rectangle(dc, 0, y, client.right, y + line_height);
-        bar.left = 0;
-        bar.top = y;
-        bar.right = 4;
-        bar.bottom = y + line_height;
-        marker = CreateSolidBrush(RGB(0, 102, 204));
-        FillRect(dc, &bar, marker);
-        DeleteObject(marker);
-    }
-    SelectObject(dc, old_brush);
-    SelectObject(dc, old_pen);
-    DeleteObject(pen);
-    if (previous_font) SelectObject(dc, previous_font);
-    ReleaseDC(window, dc);
 }
 
 static LRESULT CALLBACK marker_window_proc(HWND window, UINT message,
                                            WPARAM wparam, LPARAM lparam) {
     int side = -1;
     ViewState *view = view_from_marker(window, &side);
-    WNDPROC original = view && side >= 0 ? view->marker_original[side] : NULL;
+    WNDPROC original = view && side >= 0 ? view->marker_original[side]
+                                        : NULL;
+    if (message == WM_LBUTTONDOWN && view) {
+        view->suppress_main_click = TRUE;
+    }
     LRESULT result = original
                          ? CallWindowProcW(original, window, message, wparam,
                                            lparam)
                          : DefWindowProcW(window, message, wparam, lparam);
-    if (message == WM_PAINT && view) {
-        paint_selection_markers(view, side, window);
-    }
     if (message == WM_NCDESTROY && view && side >= 0) {
         view->marker_window[side] = NULL;
         view->marker_original[side] = NULL;
         view->marker_editor[side] = NULL;
     }
+    if (message == WM_LBUTTONUP && view)
+        view->suppress_main_click = FALSE;
     return result;
+}
+
+static LRESULT CALLBACK detail_inner_proc(HWND window, UINT message,
+                                          WPARAM wparam, LPARAM lparam) {
+    int side = -1;
+    ViewState *view = view_from_detail(window, &side);
+    WNDPROC original = view && side >= 0
+                           ? view->detail_inner_original[side]
+                           : NULL;
+    LRESULT result = original
+                         ? CallWindowProcW(original, window, message, wparam,
+                                           lparam)
+                         : DefWindowProcW(window, message, wparam, lparam);
+    if (view && (message == WM_LBUTTONUP || message == WM_KEYUP ||
+                 message == WM_HSCROLL || message == WM_MOUSEHWHEEL)) {
+        if (message == WM_LBUTTONUP) {
+            log_line("Native detail window click on side %d", side);
+            PostMessageW(view->message_window, WM_MD_SYNC_DETAIL,
+                         (WPARAM)side, 0);
+        } else {
+            sync_detail_horizontal(view, side);
+        }
+    }
+    if (message == WM_NCDESTROY && view && side >= 0) {
+        view->detail_inner[side] = NULL;
+        view->detail_inner_original[side] = NULL;
+    }
+    return result;
+}
+
+static LRESULT CALLBACK ui_message_hook(int code, WPARAM wparam,
+                                        LPARAM lparam) {
+    if (code >= 0 && wparam == PM_REMOVE) {
+        MSG *message = (MSG *)lparam;
+        if (message && message->message == WM_KEYDOWN &&
+            (GetKeyState(VK_CONTROL) & 0x8000) != 0 &&
+            (message->wParam == 'C' || message->wParam == VK_INSERT)) {
+            int side = -1;
+            HWND focused = GetFocus();
+            ViewState *view = view_from_detail(focused, &side);
+            if (view && view->proxy_active && side >= 0) {
+                void *editor =
+                    bc3_frame_detail_editor(view->frame, side);
+                if (editor) {
+                    g_bc3.execute_command(editor, EDITOR_COMMAND_COPY,
+                                          NULL);
+                    message->message = WM_NULL;
+                    message->wParam = 0;
+                    message->lParam = 0;
+                }
+            }
+        }
+    }
+    return CallNextHookEx(g_message_hook, code, wparam, lparam);
 }

@@ -5,8 +5,9 @@
 
 BOOL multidetails_initialize(void);
 void multidetails_shutdown(void);
+BOOL multidetails_before_click(void *frame, void *sender);
 void multidetails_on_click(void *frame, void *sender);
-void multidetails_on_current_changed(void *frame, void *sender);
+BOOL multidetails_on_current_changed(void *frame, void *sender);
 void multidetails_on_details_resize(void *frame);
 BOOL multidetails_is_internal_update(void);
 

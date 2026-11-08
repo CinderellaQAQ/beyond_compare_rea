@@ -18,7 +18,7 @@ PLUGIN_SRC := src/plugin/version_proxy.c src/plugin/bc3_target.c \
 BUILD_DIR := build
 DIST_DIR := dist
 PLUGIN_DLL := $(DIST_DIR)/version.dll
-SETUP_EXE := $(DIST_DIR)/BC3MultiDetails-Setup-0.2.0.exe
+SETUP_EXE := $(DIST_DIR)/BC3MultiDetails-Setup-0.2.1.exe
 
 CFLAGS := $(TOOLCHAIN_CFLAGS) -Os -Wall -Wextra -ffunction-sections \
 	-fdata-sections -DUNICODE -D_UNICODE
@@ -34,7 +34,7 @@ plugin: $(PLUGIN_DLL)
 installer: $(SETUP_EXE)
 
 test-tools: $(BUILD_DIR)/wincontrol.exe $(BUILD_DIR)/winscreenshot.exe \
-	$(BUILD_DIR)/winscroll.exe
+	$(BUILD_DIR)/winscroll.exe $(BUILD_DIR)/winclipboard.exe
 
 $(BUILD_DIR) $(DIST_DIR):
 	mkdir -p $@
@@ -65,6 +65,9 @@ $(BUILD_DIR)/winscreenshot.exe: tools/winscreenshot.c | $(BUILD_DIR)
 
 $(BUILD_DIR)/winscroll.exe: tools/winscroll.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -municode -mconsole -o $@ $< -luser32 -lkernel32
+
+$(BUILD_DIR)/winclipboard.exe: tools/winclipboard.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -mconsole -o $@ $< -luser32 -lkernel32
 
 clean:
 	rm -rf $(BUILD_DIR) $(DIST_DIR)

@@ -1,0 +1,82 @@
+name: Publish BC3 MultiDetails v0.2.1
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    if: github.event.head_commit.message == 'Publish v0.2.1 release'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out release payload
+        uses: actions/checkout@v4
+
+      - name: Verify installer
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "2ba72b0f13a0906d8c4e4d0b4fb47a3f365c06c40b4fe77b1d1524b3555f2acd  release-assets/BC3MultiDetails-Setup-0.2.1.exe" |
+            sha256sum --check --strict
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > release-notes.md <<'EOF'
+          将多行 Text Details 改为完全复用 BC3 原生文本编辑器的实现。
+
+          - `Ctrl+单击` 选择的不连续比较项直接映射为底部原生多行数据源
+          - 复用 BC3 原生字符级差异渲染、光标、选区、复制和横向滚动
+          - 点击底部任意行时，上方对比区自动跳转到对应原始行列
+          - 一行 10,000 字可完整显示、选中并复制，不再受旧位图缓存截断影响
+          - 已通过两个各 10,000 行文件、三条不连续 10,000 字差异行的回归测试
+          - 支持从正式 v0.2.0 安全原地升级
+
+          目标版本：Windows Beyond Compare 3.3.5 build 15075。
+
+          安装包 SHA-256：`2ba72b0f13a0906d8c4e4d0b4fb47a3f365c06c40b4fe77b1d1524b3555f2acd`
+
+          安装包未进行商业代码签名，Windows 可能显示 SmartScreen 提示。
+          EOF
+          gh release create v0.2.1 \
+            "release-assets/BC3MultiDetails-Setup-0.2.1.exe#Windows 安装程序" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --target "${GITHUB_SHA}" \
+            --title "BC3 MultiDetails v0.2.1" \
+            --latest \
+            --notes-file release-notes.md
+
+      - name: Remove temporary release payload
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset_sha="$(gh api "repos/${GITHUB_REPOSITORY}/contents/release-assets/BC3MultiDetails-Setup-0.2.1.exe?ref=main" --jq '.sha')"
+          gh api --method DELETE \
+            "repos/${GITHUB_REPOSITORY}/contents/release-assets/BC3MultiDetails-Setup-0.2.1.exe" \
+            -f message='Remove temporary v0.2.1 release payload' \
+            -f sha="${asset_sha}" \
+            -f branch=main
+
+      - name: Remove one-time workflow
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          workflow_sha="$(gh api "repos/${GITHUB_REPOSITORY}/contents/.github/workflows/publish-v0.2.1.yml?ref=main" --jq '.sha')"
+          gh api --method DELETE \
+            "repos/${GITHUB_REPOSITORY}/contents/.github/workflows/publish-v0.2.1.yml" \
+            -f message='Remove one-time v0.2.1 publisher' \
+            -f sha="${workflow_sha}" \
+            -f branch=main

@@ -3,14 +3,15 @@
 为 Windows 版 Beyond Compare 3.3.5（build 15075）增加可自定义多行的
 Text Details 面板。
 
-[下载 BC3MultiDetails-Setup-0.2.0.exe](https://github.com/CinderellaQAQ/beyond_compare_rea/releases/latest/download/BC3MultiDetails-Setup-0.2.0.exe)
+[下载 BC3MultiDetails-Setup-0.2.1.exe](https://github.com/CinderellaQAQ/beyond_compare_rea/releases/latest/download/BC3MultiDetails-Setup-0.2.1.exe)
 
 ## 效果
 
 ![多行 Text Details](screenshots/bc3-windows-multidetails-text.png)
 
-选择不连续行后，每个比较对按 `L / R` 两条显示；底部唯一的横向滚动条会让
-全部条带同步移动。点击底部任意一条可放置光标并让上方正文区跳到对应行列。
+选择不连续行后，每个比较项在底部左右两侧的 BC3 原生 Text Details 编辑器中
+各占一行；底部唯一的横向滚动条会让全部原生行同步移动。点击底部任意一行可
+放置原生文本光标，并让上方正文区跳到对应行列。
 
 ![共享横向滚动条](screenshots/bc3-shared-horizontal-after-fixed.png)
 
@@ -23,13 +24,13 @@ Text Details 面板。
 - `Ctrl` + 单击：追加或取消一条不连续行。
 - `Ctrl` + `Shift` + 单击：把一个连续区间追加到已有选择。
 
-底部按比较顺序为每个选择显示一组 `L / R` 原生字符差异。底部唯一的横向
-滚动条控制全部 L/R 行；仅移动这根滚动条不会改变上方正文区。选择较多时，
-底部面板最高扩展到 360 像素，并提供自己的纵向滚动条。
+底部按比较顺序在左右原生编辑器中显示所选行的字符差异。底部唯一的横向
+滚动条控制全部行。选择较多时，底部面板最高扩展到 360 像素，并提供自己的
+纵向滚动条。
 
 在底部差异区中编辑选区：
 
-- 单击任意 L/R 文本：放置输入光标，并让上方左右正文区跳到对应行列。
+- 单击底部任意文本行：放置输入光标，并让上方左右正文区跳到对应行列。
 - 拖动：选择连续字符；`Shift` + 单击或 `Shift` + 方向键可扩展选区。
 - 方向键、`Home`、`End`：移动光标；`Ctrl` + `A`：选中当前 L/R 整行。
 - `Ctrl` + `C` 或 `Ctrl` + `Insert`：把当前选区复制到系统剪贴板。
@@ -52,12 +53,12 @@ Software 官网目前只公开提供 BC3 最终版 3.3.13，以下 3.3.5 安装�
 ## 安装
 
 1. 关闭所有 `BCompare.exe` 进程。
-2. 运行 `BC3MultiDetails-Setup-0.2.0.exe`。
+2. 运行 `BC3MultiDetails-Setup-0.2.1.exe`。
 3. 选择含有 `BCompare.exe` 的 Beyond Compare 3 安装目录，然后点击 **Install**。
 4. 重新启动 Beyond Compare，打开 Text Compare 会话。
 
-若已经安装本项目发布的 0.1.1，可直接运行 0.2.0 原地升级，无需先卸载。
-升级器只会替换 SHA-256 精确匹配 0.1.1 发布物的 DLL 与卸载器；未知
+若已经安装本项目发布的 0.2.0，可直接运行 0.2.1 原地升级，无需先卸载。
+升级器只会替换 SHA-256 精确匹配 0.2.0 发布物的 DLL 与卸载器；未知
 `version.dll` 仍会被安全保留并中止安装。
 
 安装器请求管理员权限是因为默认安装位置通常位于 Program Files。它不包含
@@ -69,6 +70,19 @@ Beyond Compare 的任何程序文件，也不会修改 `BCompare.exe`。
 - SHA-256：`1d822b3faabb8f65fc30076d32a95757a2c369ccb64ae54572e9f562280ae845`
 
 若目标目录已有其他 `version.dll`，安装会安全中止，不覆盖该文件。
+
+## 0.2.1 原生多行实现
+
+- 底部完全复用 BC3 的 `TUiEditorWindow` 原生文本编辑器、字符级差异渲染、
+  光标、选区、复制和滚动逻辑，不使用位图缓存或自绘文本。
+- 通过多行数据源代理把 `Ctrl` 选择的不连续比较项映射到原生 Text Details；
+  点击底部任意行时，再映射回上方的原始比较位置。
+- 多行模式下关闭原编辑器的单行约束并启用原生文本选择；退出多行模式时恢复
+  BC3 原始选项。
+- 将 BC3 原生行解析器的单行容量提升到其 `65,536` 上限，已验证一行
+  10,000 字可完整显示、选中并复制。
+- 两个各 10,000 行的压力样本中同时选择三条不连续的 10,000 字差异行，
+  原生共享横向滚动与点击回跳均通过回归测试。
 
 ## 0.2.0 新功能
 
@@ -104,9 +118,9 @@ Beyond Compare 的任何程序文件，也不会修改 `BCompare.exe`。
 ## 实现与安全边界
 
 扩展使用应用目录中的 `version.dll` 代理转发 BC3 所需的六个 Windows 版本
-API，并仅在目标文件大小及关键机器码均匹配时启用内联挂钩。多行面板复用
-BC3 原生 Text Details 编辑器生成字符级高亮，再把选中行缓存为可同步滚动的
-L/R 条带。
+API，并仅在目标文件大小及关键机器码均匹配时启用内联挂钩。多行面板直接
+复用 BC3 原生 Text Details 编辑器，并通过代理数据源把多个选中比较项呈现为
+多条原生文本行；扩展不缓存或拼接差异位图。
 
 运行日志位于 `%TEMP%\BC3MultiDetails.log`。若验证失败，扩展保持停用并在日志
 中记录原因。
@@ -134,6 +148,6 @@ make CC=/path/to/i686-w64-mingw32-gcc \
 输出：
 
 - `dist/version.dll`
-- `dist/BC3MultiDetails-Setup-0.2.0.exe`
+- `dist/BC3MultiDetails-Setup-0.2.1.exe`
 
 本次最终构建 SHA-256 见 `docs/TEST_REPORT.md`。
