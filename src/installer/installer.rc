@@ -16,8 +16,8 @@
 #define IDCANCEL 2
 
 1 VERSIONINFO
- FILEVERSION 0,1,1,0
- PRODUCTVERSION 0,1,1,0
+ FILEVERSION 0,2,0,0
+ PRODUCTVERSION 0,2,0,0
  FILEFLAGSMASK 0x3fL
  FILEFLAGS 0x0L
  FILEOS 0x40004L
@@ -30,11 +30,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "BC3 MultiDetails Project"
             VALUE "FileDescription", "Setup for BC3 MultiDetails"
-            VALUE "FileVersion", "0.1.1.0"
+            VALUE "FileVersion", "0.2.0.0"
             VALUE "InternalName", "BC3MultiDetailsSetup.exe"
             VALUE "OriginalFilename", "BC3MultiDetailsSetup.exe"
             VALUE "ProductName", "BC3 MultiDetails"
-            VALUE "ProductVersion", "0.1.1"
+            VALUE "ProductVersion", "0.2.0"
         END
     END
     BLOCK "VarFileInfo"
@@ -51,7 +51,7 @@ STYLE DS_SETFONT | DS_MODALFRAME | DS_FIXEDSYS | WS_POPUP | WS_CAPTION | WS_SYSM
 CAPTION "BC3 MultiDetails Setup"
 FONT 9, "Segoe UI"
 BEGIN
-    LTEXT "Adds selectable multi-row Text Details to Beyond Compare 3.", -1, 14, 12, 302, 12
+    LTEXT "Adds interactive multi-row Text Details to Beyond Compare 3.", -1, 14, 12, 302, 12
     LTEXT "Supported target: Windows BC3 3.3.5 (build 15075) only.", -1, 14, 29, 302, 12
     LTEXT "Beyond Compare 3 folder:", -1, 14, 54, 180, 10
     EDITTEXT IDC_INSTALL_PATH, 14, 68, 252, 14, ES_AUTOHSCROLL

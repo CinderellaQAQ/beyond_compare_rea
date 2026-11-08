@@ -34,6 +34,7 @@ typedef struct Bc3Api {
     uint8_t *module_base;
     int (__cdecl *get_cur_item)(void *editor);
     void (__cdecl *set_cur_item)(void *editor, int item);
+    void (__cdecl *set_caret_x)(void *editor, int x);
     int (__cdecl *get_x_count)(void *editor);
     int (__cdecl *get_left_x)(void *editor);
     void (__cdecl *set_left_x)(void *editor, int x);
@@ -41,6 +42,7 @@ typedef struct Bc3Api {
     int (__cdecl *get_top_item)(void *editor);
     void (__cdecl *set_top_item)(void *editor, int item);
     void (__cdecl *set_control_height)(void *control, int height);
+    void (__cdecl *notify_current_changed)(void *frame, void *sender);
 } Bc3Api;
 
 extern Bc3Api g_bc3;

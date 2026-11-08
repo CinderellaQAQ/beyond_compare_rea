@@ -12,7 +12,7 @@
 #include "resource.h"
 
 #define PRODUCT_NAME L"BC3 MultiDetails"
-#define PRODUCT_VERSION L"0.1.1"
+#define PRODUCT_VERSION L"0.2.0"
 #define TARGET_EXE L"BCompare.exe"
 #define PLUGIN_NAME L"version.dll"
 #define UNINSTALLER_NAME L"BC3MultiDetailsUninstall.exe"
@@ -40,20 +40,20 @@ static const BYTE target_sha256[32] = {
     0x72, 0xe9, 0xf5, 0x62, 0x28, 0x0a, 0xe8, 0x45
 };
 
-/* Exact v0.1.0 release artifacts.  These are the only pre-existing files
-   that the v0.1.1 installer is allowed to replace during an upgrade. */
+/* Exact v0.1.1 release artifacts.  These are the only pre-existing files
+   that the v0.2.0 installer is allowed to replace during an upgrade. */
 static const BYTE previous_plugin_sha256[32] = {
-    0x50, 0xda, 0x92, 0x4e, 0xe9, 0x31, 0xb3, 0xe2,
-    0x47, 0xc0, 0x13, 0xac, 0x9f, 0x9f, 0x91, 0xe5,
-    0xdc, 0x31, 0x75, 0xab, 0x35, 0x6c, 0x3a, 0x6f,
-    0x6a, 0x45, 0xea, 0x1a, 0x0b, 0x41, 0x85, 0xd8
+    0x20, 0x7a, 0x64, 0xa0, 0x09, 0x40, 0xf2, 0x4e,
+    0x85, 0x60, 0xc9, 0x74, 0x29, 0xd7, 0x68, 0xcb,
+    0x02, 0x51, 0xd1, 0x45, 0xdd, 0xec, 0x4a, 0x65,
+    0x97, 0xc9, 0x8e, 0x66, 0x4b, 0x9c, 0x91, 0xde
 };
 
 static const BYTE previous_setup_sha256[32] = {
-    0x7f, 0xf0, 0x57, 0x91, 0x3e, 0xdc, 0x80, 0x54,
-    0x4f, 0x1f, 0x75, 0x30, 0x23, 0x82, 0x6b, 0xcb,
-    0xb3, 0x8d, 0xc2, 0x6e, 0x05, 0x31, 0xfd, 0x1f,
-    0xce, 0x91, 0x46, 0x74, 0x7f, 0x96, 0xb6, 0x9b
+    0xb1, 0x49, 0x40, 0xe8, 0x01, 0x5d, 0x09, 0x55,
+    0xee, 0xac, 0xbb, 0x66, 0x1d, 0x8f, 0xdc, 0xec,
+    0x69, 0x92, 0x65, 0x29, 0x0e, 0x7f, 0x15, 0x1a,
+    0xda, 0xe6, 0x2c, 0x44, 0x48, 0x0d, 0xfd, 0xde
 };
 
 static HINSTANCE instance_handle;
@@ -350,6 +350,14 @@ static BOOL write_uninstaller(const WCHAR *directory) {
         if (!MoveFileExW(temporary, destination,
                          MOVEFILE_REPLACE_EXISTING |
                          MOVEFILE_WRITE_THROUGH)) {
+            /* Wine and a few older Windows filesystem filters can reject an
+               atomic executable replacement even when neither file is open.
+               The existing file was hash-authorized above, so use the normal
+               CopyFile replacement path as a compatibility fallback. */
+            if (CopyFileW(source, destination, FALSE)) {
+                DeleteFileW(temporary);
+                return TRUE;
+            }
             DeleteFileW(temporary);
             return FALSE;
         }
@@ -527,7 +535,17 @@ static int perform_install(const WCHAR *directory, WCHAR *message,
         return GetLastError() == ERROR_ALREADY_EXISTS ?
                RESULT_CONFLICT : RESULT_IO;
     }
-    if (!write_uninstaller(directory) || !register_uninstaller(directory)) {
+    if (!write_uninstaller(directory)) {
+        DWORD error = GetLastError();
+        if (!plugin_preexisting) DeleteFileW(plugin);
+        if (!uninstaller_preexisting) DeleteFileW(uninstaller);
+        _snwprintf(message, message_capacity,
+                   L"The extension could not update the uninstaller "
+                   L"(Windows error %lu).", error);
+        message[message_capacity - 1] = L'\0';
+        return error == ERROR_ALREADY_EXISTS ? RESULT_CONFLICT : RESULT_IO;
+    }
+    if (!register_uninstaller(directory)) {
         if (!plugin_preexisting) DeleteFileW(plugin);
         if (!uninstaller_preexisting) DeleteFileW(uninstaller);
         lstrcpynW(message,
@@ -714,6 +732,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous,
         }
     } else if (options.quiet) {
         result = perform_install(options.directory, message, 512);
+        if (result != RESULT_OK) fwprintf(stderr, L"%ls\n", message);
     } else {
         result = (int)DialogBoxParamW(instance, MAKEINTRESOURCEW(IDD_INSTALLER),
                                      NULL, installer_dialog, 0);

@@ -16,6 +16,7 @@ void *g_raw_get_max_left_x_core;
 void *g_raw_get_top_item;
 void *g_raw_set_top_item;
 void *g_raw_set_control_height;
+void *g_raw_current_changed;
 
 __attribute__((naked)) static int call_get_cur_item(
     void *editor __attribute__((unused))) {
@@ -32,6 +33,15 @@ __attribute__((naked)) static void call_set_cur_item(
         "movl 8(%esp), %edx\n\t"
         "call *_g_raw_set_cur_item\n\t"
         "ret\n\t");
+}
+
+static void set_cached_caret_x(void *editor, int x) {
+    void *core;
+    if (!editor) return;
+    core = *(void **)((uint8_t *)editor + 0x280);
+    if (!core) return;
+    if (x < 0) x = 0;
+    *(int *)((uint8_t *)core + 0x2a8) = x;
 }
 
 __attribute__((naked)) static int call_get_x_count(
@@ -94,6 +104,15 @@ __attribute__((naked)) static void call_set_control_height(
         "ret\n\t");
 }
 
+__attribute__((naked)) static void call_current_changed(
+    void *frame __attribute__((unused)), void *sender __attribute__((unused))) {
+    __asm__ __volatile__(
+        "movl 4(%esp), %eax\n\t"
+        "movl 8(%esp), %edx\n\t"
+        "call *_g_raw_current_changed\n\t"
+        "ret\n\t");
+}
+
 static BOOL validate_executable_identity(void) {
     WCHAR path[MAX_PATH];
     WIN32_FILE_ATTRIBUTE_DATA attributes;
@@ -134,8 +153,10 @@ BOOL bc3_target_initialize(void) {
     g_raw_get_top_item = base + BC3_RVA_EDITOR_GET_TOP_ITEM;
     g_raw_set_top_item = base + BC3_RVA_EDITOR_SET_TOP_ITEM;
     g_raw_set_control_height = base + BC3_RVA_CONTROL_SET_HEIGHT;
+    g_raw_current_changed = base + BC3_RVA_EDITOR_CUR_CHANGED;
     g_bc3.get_cur_item = call_get_cur_item;
     g_bc3.set_cur_item = call_set_cur_item;
+    g_bc3.set_caret_x = set_cached_caret_x;
     g_bc3.get_x_count = call_get_x_count;
     g_bc3.get_left_x = call_get_left_x;
     g_bc3.set_left_x = call_set_left_x;
@@ -143,6 +164,7 @@ BOOL bc3_target_initialize(void) {
     g_bc3.get_top_item = call_get_top_item;
     g_bc3.set_top_item = call_set_top_item;
     g_bc3.set_control_height = call_set_control_height;
+    g_bc3.notify_current_changed = call_current_changed;
     return TRUE;
 }
 

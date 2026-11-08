@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
+#include <windowsx.h>
 
 #define MAX_VIEWS 8
 #define MAX_SELECTIONS 128
@@ -17,6 +18,10 @@
 #define SCROLLBAR_HEIGHT 17
 #define FIXED_GUTTER_WIDTH 18
 #define MAX_CAPTURE_WIDTH 32768
+#define WM_MD_APPLY_SELECTION (WM_APP + 0x310)
+#define SELECTION_CONTROL 0x01
+#define SELECTION_SHIFT 0x02
+#define COPY_REFOCUS_TIMER 0x4d44
 
 typedef struct CapturedStrip {
     HBITMAP bitmap;
@@ -29,6 +34,8 @@ typedef struct CapturedStrip {
 typedef struct SelectedPair {
     int key;
     int item[MAX_EDITOR_SIDES];
+    int text_length[2];
+    int cell_width;
     CapturedStrip left;
     CapturedStrip right;
 } SelectedPair;
@@ -36,6 +43,7 @@ typedef struct SelectedPair {
 typedef struct ViewState {
     void *frame;
     void *panel_object;
+    void *last_click_sender;
     HWND panel_window;
     HWND overlay;
     HWND horizontal_scroll;
@@ -44,6 +52,16 @@ typedef struct ViewState {
     int horizontal_offset;
     int vertical_offset;
     int pair_count;
+    int active_key;
+    int native_sync_key;
+    int active_side;
+    int caret_column;
+    int selection_anchor;
+    BOOL selecting;
+    BOOL caret_created;
+    BOOL caret_visible;
+    HWND copy_restore_focus;
+    BOOL copy_in_progress;
     HWND marker_window[MAX_EDITOR_SIDES];
     WNDPROC marker_original[MAX_EDITOR_SIDES];
     void *marker_editor[MAX_EDITOR_SIDES];
@@ -204,6 +222,8 @@ static ViewState *view_find(void *frame, BOOL create) {
     ZeroMemory(empty, sizeof(*empty));
     empty->frame = frame;
     empty->anchor = -1;
+    empty->active_key = -1;
+    empty->native_sync_key = -1;
     return empty;
 }
 
@@ -224,6 +244,12 @@ static int pair_index(const ViewState *view, int key) {
 static void pair_remove(ViewState *view, int index) {
     int move_count;
     if (index < 0 || index >= view->pair_count) return;
+    if (view->active_key == view->pairs[index].key) {
+        view->active_key = -1;
+        view->caret_column = 0;
+        view->selection_anchor = 0;
+        view->selecting = FALSE;
+    }
     strip_destroy(&view->pairs[index].left);
     strip_destroy(&view->pairs[index].right);
     move_count = view->pair_count - index - 1;
@@ -239,6 +265,245 @@ static void pairs_clear(ViewState *view) {
     while (view->pair_count > 0) {
         pair_remove(view, view->pair_count - 1);
     }
+}
+
+static SelectedPair *active_pair(ViewState *view) {
+    int index;
+    if (!view || view->active_key < 0) return NULL;
+    index = pair_index(view, view->active_key);
+    return index >= 0 ? &view->pairs[index] : NULL;
+}
+
+static int clamp_column(const SelectedPair *pair, int side, int column) {
+    int length;
+    if (!pair || side < 0 || side > 1) return 0;
+    length = pair->text_length[side];
+    if (length < 0) length = 0;
+    if (column < 0) return 0;
+    if (column > length) return length;
+    return column;
+}
+
+static BOOL detail_hit_test(ViewState *view, int x, int y,
+                            SelectedPair **pair_out, int *side_out,
+                            int *column_out) {
+    int row_y;
+    int index;
+    if (!view || x < FIXED_GUTTER_WIDTH) return FALSE;
+    row_y = HEADER_HEIGHT - view->vertical_offset;
+    for (index = 0; index < view->pair_count; ++index) {
+        SelectedPair *pair = &view->pairs[index];
+        int left_top = row_y + CAPTION_HEIGHT;
+        int right_top = left_top + pair->left.height;
+        int side = -1;
+        int column;
+        if (y >= left_top && y < left_top + pair->left.height) side = 0;
+        if (y >= right_top && y < right_top + pair->right.height) side = 1;
+        if (side >= 0) {
+            int width = pair->cell_width > 0 ? pair->cell_width : 1;
+            int content_x = view->horizontal_offset +
+                            x - FIXED_GUTTER_WIDTH;
+            column = (content_x + width / 2) / width;
+            if (pair_out) *pair_out = pair;
+            if (side_out) *side_out = side;
+            if (column_out)
+                *column_out = clamp_column(pair, side, column);
+            return TRUE;
+        }
+        row_y += CAPTION_HEIGHT + pair->left.height +
+                 pair->right.height + 3;
+    }
+    return FALSE;
+}
+
+static int active_strip_top(ViewState *view, const SelectedPair *active) {
+    int y = HEADER_HEIGHT - view->vertical_offset;
+    int index;
+    for (index = 0; index < view->pair_count; ++index) {
+        const SelectedPair *pair = &view->pairs[index];
+        if (pair == active) {
+            y += CAPTION_HEIGHT;
+            if (view->active_side == 1) y += pair->left.height;
+            return y;
+        }
+        y += CAPTION_HEIGHT + pair->left.height + pair->right.height + 3;
+    }
+    return -1000;
+}
+
+static void update_overlay_caret(ViewState *view) {
+    SelectedPair *pair;
+    int x;
+    int y;
+    if (!view || !view->overlay || GetFocus() != view->overlay) return;
+    pair = active_pair(view);
+    if (!view->caret_created) {
+        if (!CreateCaret(view->overlay, NULL, 2, 15)) return;
+        view->caret_created = TRUE;
+    }
+    if (!view->caret_visible) {
+        ShowCaret(view->overlay);
+        view->caret_visible = TRUE;
+    }
+    if (!pair) {
+        SetCaretPos(-100, -100);
+        return;
+    }
+    x = FIXED_GUTTER_WIDTH +
+        view->caret_column * (pair->cell_width > 0 ? pair->cell_width : 1) -
+        view->horizontal_offset;
+    y = active_strip_top(view, pair);
+    SetCaretPos(x, y);
+}
+
+static void ensure_bottom_caret_visible(ViewState *view) {
+    SelectedPair *pair = active_pair(view);
+    RECT client;
+    SCROLLINFO info;
+    int cell_width;
+    int pixel;
+    int page;
+    int position;
+    if (!pair || !view->horizontal_scroll ||
+        !GetClientRect(view->overlay, &client)) return;
+    cell_width = pair->cell_width > 0 ? pair->cell_width : 1;
+    pixel = view->caret_column * cell_width;
+    page = client.right - FIXED_GUTTER_WIDTH;
+    if (page < cell_width) page = cell_width;
+    position = view->horizontal_offset;
+    if (pixel < position) position = pixel;
+    if (pixel > position + page - cell_width)
+        position = pixel - page + cell_width;
+    ZeroMemory(&info, sizeof(info));
+    info.cbSize = sizeof(info);
+    info.fMask = SIF_POS;
+    info.nPos = position;
+    SetScrollInfo(view->horizontal_scroll, SB_CTL, &info, TRUE);
+    view->horizontal_offset =
+        GetScrollPos(view->horizontal_scroll, SB_CTL);
+}
+
+static void sync_upper_to_caret(ViewState *view) {
+    SelectedPair *pair = active_pair(view);
+    int side;
+    if (!pair) return;
+    g_internal_update = TRUE;
+    for (side = 0; side < 2; ++side) {
+        void *editor = bc3_frame_main_editor(view->frame, side);
+        if (editor && pair->item[side] >= 0)
+            g_bc3.set_cur_item(editor, pair->item[side]);
+    }
+    if (g_bc3.notify_current_changed &&
+        view->native_sync_key != pair->key) {
+        void *sender = view->last_click_sender;
+        if (!sender)
+            sender = bc3_frame_main_editor(view->frame,
+                                           view->active_side);
+        if (sender) {
+            g_bc3.notify_current_changed(view->frame, sender);
+            view->native_sync_key = pair->key;
+        }
+    }
+    for (side = 0; side < 2; ++side) {
+        void *editor = bc3_frame_main_editor(view->frame, side);
+        HWND paint_window;
+        RECT client;
+        int visible_columns = 1;
+        int target;
+        int maximum;
+        if (!editor) continue;
+        paint_window = editor_paint_window(editor);
+        if (paint_window && GetClientRect(paint_window, &client) &&
+            pair->cell_width > 0) {
+            visible_columns =
+                (client.right - FIXED_GUTTER_WIDTH) / pair->cell_width;
+            if (visible_columns < 1) visible_columns = 1;
+        }
+        target = view->caret_column - visible_columns / 2;
+        if (target < 0) target = 0;
+        maximum = g_bc3.get_max_left_x(editor);
+        if (maximum < 0) maximum = 0;
+        if (target > maximum) target = maximum;
+        g_bc3.set_left_x(editor, target);
+        if (paint_window) InvalidateRect(paint_window, NULL, FALSE);
+    }
+    g_internal_update = FALSE;
+}
+
+static void inject_key(WORD key, BOOL up) {
+    INPUT input;
+    ZeroMemory(&input, sizeof(input));
+    input.type = INPUT_KEYBOARD;
+    input.ki.wVk = key;
+    input.ki.dwFlags = up ? KEYEVENTF_KEYUP : 0;
+    SendInput(1, &input, sizeof(input));
+}
+
+static void copy_active_selection(ViewState *view) {
+    SelectedPair *pair = active_pair(view);
+    void *editor;
+    HWND window;
+    HWND old_focus;
+    int start;
+    int end;
+    int index;
+    if (!pair || view->copy_in_progress) return;
+    start = view->selection_anchor;
+    end = view->caret_column;
+    if (start > end) {
+        int temporary = start;
+        start = end;
+        end = temporary;
+    }
+    start = clamp_column(pair, view->active_side, start);
+    end = clamp_column(pair, view->active_side, end);
+    if (start == end) return;
+    sync_upper_to_caret(view);
+    editor = bc3_frame_detail_editor(view->frame, view->active_side);
+    window = editor_paint_window(editor);
+    if (!window) return;
+    old_focus = GetFocus();
+    KillTimer(view->overlay, COPY_REFOCUS_TIMER);
+    view->copy_restore_focus =
+        old_focus && IsWindow(old_focus) ? old_focus : view->overlay;
+    SetFocus(window);
+    view->copy_in_progress = TRUE;
+    /* BC3's editor checks the real input queue rather than only WM_KEYDOWN.
+       Release modifiers inherited from the invoking shortcut, build the
+       native selection, copy it, then restore focus from a short timer. */
+    inject_key(VK_CONTROL, TRUE);
+    inject_key(VK_SHIFT, TRUE);
+    inject_key(VK_MENU, TRUE);
+    if (start == 0 && end == pair->text_length[view->active_side]) {
+        inject_key(VK_CONTROL, FALSE);
+        inject_key('A', FALSE);
+        inject_key('A', TRUE);
+        inject_key('C', FALSE);
+        inject_key('C', TRUE);
+        inject_key(VK_CONTROL, TRUE);
+        SetTimer(view->overlay, COPY_REFOCUS_TIMER, 30, NULL);
+        return;
+    }
+    if (start > 0) {
+        g_bc3.set_caret_x(editor, start - 1);
+        inject_key(VK_RIGHT, FALSE);
+        inject_key(VK_RIGHT, TRUE);
+    } else {
+        g_bc3.set_caret_x(editor, 0);
+        inject_key(VK_HOME, FALSE);
+        inject_key(VK_HOME, TRUE);
+    }
+    inject_key(VK_SHIFT, FALSE);
+    for (index = start; index < end; ++index) {
+        inject_key(VK_RIGHT, FALSE);
+        inject_key(VK_RIGHT, TRUE);
+    }
+    inject_key(VK_SHIFT, TRUE);
+    inject_key(VK_CONTROL, FALSE);
+    inject_key('C', FALSE);
+    inject_key('C', TRUE);
+    inject_key(VK_CONTROL, TRUE);
+    SetTimer(view->overlay, COPY_REFOCUS_TIMER, 30, NULL);
 }
 
 static BOOL ensure_overlay(ViewState *view) {
@@ -258,7 +523,8 @@ static BOOL ensure_overlay(ViewState *view) {
     if (!view->overlay || !IsWindow(view->overlay)) {
         view->overlay = CreateWindowExW(
             0, OVERLAY_CLASS, L"", WS_CHILD | WS_VISIBLE | WS_VSCROLL |
-            WS_CLIPSIBLINGS | WS_CLIPCHILDREN, 0, 0, rect.right, rect.bottom,
+            WS_TABSTOP | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
+            0, 0, rect.right, rect.bottom,
             view->panel_window, NULL, g_instance, view);
         if (!view->overlay) {
             log_line("CreateWindow overlay failed: %lu", GetLastError());
@@ -458,6 +724,10 @@ static BOOL capture_current_pair(ViewState *view, SelectedPair *pair) {
         cell_width = (viewport + visible_columns - 1) / visible_columns;
         if (cell_width < 1) cell_width = 1;
     }
+    pair->cell_width = cell_width;
+    /* BC3 exposes the final character coordinate, not a character count. */
+    pair->text_length[0] = left_x_count + 1;
+    pair->text_length[1] = right_x_count + 1;
     content_width = viewport + max_scroll * cell_width;
     if (content_width > MAX_CAPTURE_WIDTH) content_width = MAX_CAPTURE_WIDTH;
     if (!strip_create(&pair->left, FIXED_GUTTER_WIDTH + content_width,
@@ -567,6 +837,7 @@ static BOOL add_current_pair(ViewState *view, int key) {
     if (!capture_current_pair(view, pair)) {
         strip_destroy(&pair->left);
         strip_destroy(&pair->right);
+        ZeroMemory(pair, sizeof(*pair));
         return FALSE;
     }
     ++view->pair_count;
@@ -649,6 +920,7 @@ static void refresh_view(ViewState *view) {
         if (view->marker_window[side])
             InvalidateRect(view->marker_window[side], NULL, FALSE);
     }
+    update_overlay_caret(view);
 }
 
 static void restore_main_editors(ViewState *view, int items[4], int tops[4]) {
@@ -699,12 +971,36 @@ static void select_range(ViewState *view, int start, int end, BOOL append) {
     g_internal_update = FALSE;
 }
 
+static void apply_selection(ViewState *view, int key, BOOL control,
+                            BOOL shift) {
+    int index;
+    if (!view || key < 0) return;
+    if (control && shift && view->anchor >= 0) {
+        select_range(view, view->anchor, key, TRUE);
+    } else if (control) {
+        index = pair_index(view, key);
+        if (index >= 0) {
+            pair_remove(view, index);
+        } else {
+            add_current_pair(view, key);
+        }
+        view->anchor = key;
+    } else if (shift && view->anchor >= 0) {
+        select_range(view, view->anchor, key, FALSE);
+    } else {
+        pairs_clear(view);
+        add_current_pair(view, key);
+        view->anchor = key;
+    }
+    refresh_view(view);
+}
+
 BOOL multidetails_initialize(void) {
     WNDCLASSW window_class;
     NONCLIENTMETRICSW metrics;
     g_instance = (HINSTANCE)GetModuleHandleW(L"version.dll");
     ZeroMemory(&window_class, sizeof(window_class));
-    window_class.style = CS_HREDRAW | CS_VREDRAW;
+    window_class.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
     window_class.lpfnWndProc = overlay_window_proc;
     window_class.hInstance = g_instance;
     window_class.hCursor = LoadCursorW(NULL, MAKEINTRESOURCEW(32512));
@@ -750,38 +1046,25 @@ void multidetails_on_click(void *frame, void *sender) {
     ViewState *view;
     void *driver;
     int key;
-    int index;
-    BOOL control;
-    BOOL shift;
-    (void)sender;
+    LPARAM flags = 0;
     if (g_internal_update || !frame) return;
     view = view_find(frame, TRUE);
     if (!view || !ensure_overlay(view)) return;
+    view->last_click_sender = sender;
     driver = bc3_frame_main_editor(frame, 0);
     if (!driver) return;
     key = g_bc3.get_cur_item(driver);
     if (key < 0) return;
-    control = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
-    shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
-
-    if (control && shift && view->anchor >= 0) {
-        select_range(view, view->anchor, key, TRUE);
-    } else if (control) {
-        index = pair_index(view, key);
-        if (index >= 0) {
-            pair_remove(view, index);
-        } else {
-            add_current_pair(view, key);
-        }
-        view->anchor = key;
-    } else if (shift && view->anchor >= 0) {
-        select_range(view, view->anchor, key, FALSE);
-    } else {
-        pairs_clear(view);
-        add_current_pair(view, key);
-        view->anchor = key;
-    }
-    refresh_view(view);
+    /* EditorClick has already returned from BC3's original handler, so the
+       native one-line details editors now represent this key. */
+    view->native_sync_key = key;
+    if ((GetKeyState(VK_CONTROL) & 0x8000) != 0)
+        flags |= SELECTION_CONTROL;
+    if ((GetKeyState(VK_SHIFT) & 0x8000) != 0)
+        flags |= SELECTION_SHIFT;
+    /* EditorClick runs while BC3 still owns the text-source lock.  Defer the
+       selection/capture work until that callback has completely returned. */
+    PostMessageW(view->overlay, WM_MD_APPLY_SELECTION, (WPARAM)key, flags);
 }
 
 void multidetails_on_current_changed(void *frame, void *sender) {
@@ -821,6 +1104,54 @@ static void paint_strip(HDC destination, const CapturedStrip *strip,
     }
 }
 
+static void paint_detail_selection(ViewState *view, HDC dc,
+                                   SelectedPair *pair, int pair_y,
+                                   const RECT *client) {
+    RECT selection;
+    int start;
+    int end;
+    int cell_width;
+    int strip_top;
+    int strip_height;
+    if (!view || !pair || view->active_key != pair->key ||
+        view->selection_anchor == view->caret_column) return;
+    start = view->selection_anchor;
+    end = view->caret_column;
+    if (start > end) {
+        int temporary = start;
+        start = end;
+        end = temporary;
+    }
+    start = clamp_column(pair, view->active_side, start);
+    end = clamp_column(pair, view->active_side, end);
+    if (start == end) return;
+    cell_width = pair->cell_width > 0 ? pair->cell_width : 1;
+    strip_top = pair_y + CAPTION_HEIGHT;
+    strip_height = pair->left.height;
+    if (view->active_side == 1) {
+        strip_top += pair->left.height;
+        strip_height = pair->right.height;
+    }
+    selection.left = FIXED_GUTTER_WIDTH + start * cell_width -
+                     view->horizontal_offset;
+    selection.right = FIXED_GUTTER_WIDTH + end * cell_width -
+                      view->horizontal_offset;
+    selection.top = strip_top;
+    selection.bottom = strip_top + strip_height;
+    if (selection.left < FIXED_GUTTER_WIDTH)
+        selection.left = FIXED_GUTTER_WIDTH;
+    if (selection.right > client->right)
+        selection.right = client->right;
+    if (selection.top < HEADER_HEIGHT)
+        selection.top = HEADER_HEIGHT;
+    if (selection.bottom > client->bottom - SCROLLBAR_HEIGHT)
+        selection.bottom = client->bottom - SCROLLBAR_HEIGHT;
+    if (selection.right > selection.left &&
+        selection.bottom > selection.top) {
+        InvertRect(dc, &selection);
+    }
+}
+
 static void paint_overlay(ViewState *view, HDC dc, const RECT *client) {
     HBRUSH face = CreateSolidBrush(GetSysColor(COLOR_BTNFACE));
     HBRUSH window_brush = CreateSolidBrush(GetSysColor(COLOR_WINDOW));
@@ -837,7 +1168,7 @@ static void paint_overlay(ViewState *view, HDC dc, const RECT *client) {
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, GetSysColor(COLOR_BTNTEXT));
     _snwprintf(text, 255,
-               L"Text Details  |  %d comparison row%s selected  |  Ctrl+click: toggle, Shift+click: range",
+               L"Text Details  |  %d row%s  |  Click/drag: select text, Ctrl+C: copy  |  Ctrl+click/Shift+click above: rows",
                view->pair_count, view->pair_count == 1 ? L"" : L"s");
     TextOutW(dc, 7, 5, text, lstrlenW(text));
 
@@ -858,6 +1189,7 @@ static void paint_overlay(ViewState *view, HDC dc, const RECT *client) {
             paint_strip(dc, &pair->right, 0,
                         y + CAPTION_HEIGHT + pair->left.height,
                         client->right, view->horizontal_offset);
+            paint_detail_selection(view, dc, pair, y, client);
             MoveToEx(dc, 0, y + pair_height - 1, NULL);
             LineTo(dc, client->right, y + pair_height - 1);
         }
@@ -901,6 +1233,31 @@ static void handle_scroll(ViewState *view, HWND bar, int scroll_bar,
     if (scroll_bar == SB_CTL) view->horizontal_offset = position;
     else view->vertical_offset = position;
     InvalidateRect(view->overlay, NULL, FALSE);
+    update_overlay_caret(view);
+}
+
+static int column_from_active_x(ViewState *view, int x) {
+    SelectedPair *pair = active_pair(view);
+    int cell_width;
+    int content_x;
+    if (!pair) return 0;
+    cell_width = pair->cell_width > 0 ? pair->cell_width : 1;
+    content_x = view->horizontal_offset + x - FIXED_GUTTER_WIDTH;
+    return clamp_column(pair, view->active_side,
+                        (content_x + cell_width / 2) / cell_width);
+}
+
+static void move_active_caret(ViewState *view, int column,
+                              BOOL extend_selection) {
+    SelectedPair *pair = active_pair(view);
+    if (!pair) return;
+    column = clamp_column(pair, view->active_side, column);
+    if (!extend_selection) view->selection_anchor = column;
+    view->caret_column = column;
+    ensure_bottom_caret_visible(view);
+    sync_upper_to_caret(view);
+    InvalidateRect(view->overlay, NULL, FALSE);
+    update_overlay_caret(view);
 }
 
 static LRESULT CALLBACK overlay_window_proc(HWND window, UINT message,
@@ -921,6 +1278,140 @@ static LRESULT CALLBACK overlay_window_proc(HWND window, UINT message,
                 update_scrollbars(view);
             }
             return 0;
+        case WM_GETDLGCODE:
+            return DLGC_WANTARROWS | DLGC_WANTCHARS | DLGC_WANTALLKEYS;
+        case WM_SETFOCUS:
+            if (view) update_overlay_caret(view);
+            return 0;
+        case WM_KILLFOCUS:
+            if (view && view->caret_created) {
+                if (view->caret_visible) HideCaret(window);
+                DestroyCaret();
+                view->caret_created = FALSE;
+                view->caret_visible = FALSE;
+            }
+            return 0;
+        case WM_LBUTTONDOWN:
+            if (view) {
+                SelectedPair *pair = NULL;
+                int side = -1;
+                int column = 0;
+                if (detail_hit_test(view, GET_X_LPARAM(lparam),
+                                    GET_Y_LPARAM(lparam), &pair, &side,
+                                    &column)) {
+                    BOOL extend = (GetKeyState(VK_SHIFT) & 0x8000) != 0 &&
+                                  view->active_key == pair->key &&
+                                  view->active_side == side;
+                    SetFocus(window);
+                    view->active_key = pair->key;
+                    view->active_side = side;
+                    if (!extend) view->selection_anchor = column;
+                    view->caret_column = column;
+                    view->selecting = TRUE;
+                    SetCapture(window);
+                    sync_upper_to_caret(view);
+                    InvalidateRect(window, NULL, FALSE);
+                    update_overlay_caret(view);
+                }
+            }
+            return 0;
+        case WM_MOUSEMOVE:
+            if (view && view->selecting && GetCapture() == window &&
+                (wparam & MK_LBUTTON)) {
+                view->caret_column = column_from_active_x(
+                    view, GET_X_LPARAM(lparam));
+                ensure_bottom_caret_visible(view);
+                sync_upper_to_caret(view);
+                InvalidateRect(window, NULL, FALSE);
+                update_overlay_caret(view);
+            }
+            return 0;
+        case WM_LBUTTONUP:
+            if (view && view->selecting) {
+                view->caret_column = column_from_active_x(
+                    view, GET_X_LPARAM(lparam));
+                view->selecting = FALSE;
+                if (GetCapture() == window) ReleaseCapture();
+                ensure_bottom_caret_visible(view);
+                sync_upper_to_caret(view);
+                InvalidateRect(window, NULL, FALSE);
+                update_overlay_caret(view);
+            }
+            return 0;
+        case WM_CAPTURECHANGED:
+            if (view) view->selecting = FALSE;
+            return 0;
+        case WM_TIMER:
+            if (view && wparam == COPY_REFOCUS_TIMER) {
+                KillTimer(window, COPY_REFOCUS_TIMER);
+                SetFocus(view->copy_restore_focus &&
+                                 IsWindow(view->copy_restore_focus)
+                             ? view->copy_restore_focus : window);
+                view->copy_restore_focus = NULL;
+                view->copy_in_progress = FALSE;
+                update_overlay_caret(view);
+                return 0;
+            }
+            break;
+        case WM_KEYDOWN:
+            if (view && active_pair(view)) {
+                SelectedPair *pair = active_pair(view);
+                BOOL control = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+                BOOL shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+                if (control && (wparam == 'C' || wparam == VK_INSERT)) {
+                    copy_active_selection(view);
+                    return 0;
+                }
+                if (control && wparam == 'A') {
+                    view->selection_anchor = 0;
+                    view->caret_column = pair->text_length[view->active_side];
+                    ensure_bottom_caret_visible(view);
+                    sync_upper_to_caret(view);
+                    InvalidateRect(window, NULL, FALSE);
+                    update_overlay_caret(view);
+                    return 0;
+                }
+                switch (wparam) {
+                    case VK_LEFT:
+                        move_active_caret(view, view->caret_column - 1,
+                                          shift);
+                        return 0;
+                    case VK_RIGHT:
+                        move_active_caret(view, view->caret_column + 1,
+                                          shift);
+                        return 0;
+                    case VK_HOME:
+                        move_active_caret(view, 0, shift);
+                        return 0;
+                    case VK_END:
+                        move_active_caret(
+                            view, pair->text_length[view->active_side],
+                            shift);
+                        return 0;
+                    case VK_ESCAPE:
+                        view->selection_anchor = view->caret_column;
+                        InvalidateRect(window, NULL, FALSE);
+                        return 0;
+                }
+            }
+            break;
+        case WM_CHAR:
+            if (view && wparam == 1 && active_pair(view)) {
+                SelectedPair *pair = active_pair(view);
+                view->selection_anchor = 0;
+                view->caret_column =
+                    pair->text_length[view->active_side];
+                ensure_bottom_caret_visible(view);
+                sync_upper_to_caret(view);
+                InvalidateRect(window, NULL, FALSE);
+                update_overlay_caret(view);
+                return 0;
+            }
+            if (view && wparam == 3) {
+                copy_active_selection(view);
+                return 0;
+            }
+            break;
         case WM_HSCROLL:
             if (view) handle_scroll(view, (HWND)lparam, SB_CTL, wparam);
             return 0;
@@ -935,6 +1426,13 @@ static LRESULT CALLBACK overlay_window_proc(HWND window, UINT message,
                                          0));
             }
             return 0;
+        case WM_MD_APPLY_SELECTION:
+            if (view) {
+                apply_selection(view, (int)wparam,
+                                (lparam & SELECTION_CONTROL) != 0,
+                                (lparam & SELECTION_SHIFT) != 0);
+            }
+            return 0;
         case WM_PAINT: {
             PAINTSTRUCT paint;
             RECT client;
@@ -942,8 +1440,16 @@ static LRESULT CALLBACK overlay_window_proc(HWND window, UINT message,
             GetClientRect(window, &client);
             if (view) paint_overlay(view, dc, &client);
             EndPaint(window, &paint);
+            if (view) update_overlay_caret(view);
             return 0;
         }
+        case WM_DESTROY:
+            if (view && view->caret_created) {
+                DestroyCaret();
+                view->caret_created = FALSE;
+                view->caret_visible = FALSE;
+            }
+            return 0;
     }
     return DefWindowProcW(window, message, wparam, lparam);
 }
