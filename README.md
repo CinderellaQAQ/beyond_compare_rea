@@ -3,7 +3,8 @@
 为 Windows 版 Beyond Compare 3.3.5（build 15075）增加可自定义多行的
 Text Details 面板。
 
-[下载 BC3MultiDetails-Setup-0.2.1.exe](https://github.com/CinderellaQAQ/beyond_compare_rea/releases/latest/download/BC3MultiDetails-Setup-0.2.1.exe)
+当前 GitHub 正式版：
+[BC3MultiDetails-Setup-0.2.2.exe](https://github.com/CinderellaQAQ/beyond_compare_rea/releases/latest/download/BC3MultiDetails-Setup-0.2.2.exe)。
 
 ## 效果
 
@@ -53,12 +54,12 @@ Software 官网目前只公开提供 BC3 最终版 3.3.13，以下 3.3.5 安装�
 ## 安装
 
 1. 关闭所有 `BCompare.exe` 进程。
-2. 运行 `BC3MultiDetails-Setup-0.2.1.exe`。
+2. 运行 `BC3MultiDetails-Setup-0.2.2.exe`。
 3. 选择含有 `BCompare.exe` 的 Beyond Compare 3 安装目录，然后点击 **Install**。
 4. 重新启动 Beyond Compare，打开 Text Compare 会话。
 
-若已经安装本项目发布的 0.2.0，可直接运行 0.2.1 原地升级，无需先卸载。
-升级器只会替换 SHA-256 精确匹配 0.2.0 发布物的 DLL 与卸载器；未知
+若已经安装本项目发布的 0.2.0 或 0.2.1，可直接运行 0.2.2 原地升级，无需先
+卸载。升级器只会替换 SHA-256 精确匹配这两个正式版本的 DLL 与卸载器；未知
 `version.dll` 仍会被安全保留并中止安装。
 
 安装器请求管理员权限是因为默认安装位置通常位于 Program Files。它不包含
@@ -70,6 +71,24 @@ Beyond Compare 的任何程序文件，也不会修改 `BCompare.exe`。
 - SHA-256：`1d822b3faabb8f65fc30076d32a95757a2c369ccb64ae54572e9f562280ae845`
 
 若目标目录已有其他 `version.dll`，安装会安全中止，不覆盖该文件。
+
+## 0.2.2 应用错误修复
+
+- 修复第二条及后续所选行进入 BC3 两条原生样式回调时仍携带代理局部行号的
+  问题。现在单元格样式和整行样式入口都会先把局部行号映射回原始比较行，
+  避免 `TextContent` 访问不存在的行类别并触发 Delphi 原生断言。
+- 上方正文当前行改为调用 BC3 原生设置器，不再直接改写内部当前行字段；原生
+  设置器会同步视觉行、光标几何和重绘范围，灰色当前行边框不会再穿过文字。
+- 修复多行详情已有若干行后，再从上方选择普通短行时，BC3 把原始行号直接写
+  入较短的底部代理并触发 `item >= count` 原生断言的问题。
+- 主编辑器的当前行变化在多行代理活动期间只同步上方区域；底部变更通过行号
+  映射队列完成，避免原版单行同步与多行代理竞争。
+- 详情数据源重绑延迟到 BC3 当前点击处理器释放模型锁之后，并保留原生数据源
+  的锁定/解锁方法，避免后台比较与底部绘制并发读取中间状态。
+- 比较会话原地重载时刷新原始数据源及模型所有者，不再保留上一会话的失效
+  指针。
+- 已复跑三条 10,000 字符差异、共享横向滚动到位置 8,379、底部点击回跳、
+  `CF_UNICODETEXT 10000` 完整复制以及 150% DPI 边框显示。
 
 ## 0.2.1 原生多行实现
 
@@ -148,6 +167,6 @@ make CC=/path/to/i686-w64-mingw32-gcc \
 输出：
 
 - `dist/version.dll`
-- `dist/BC3MultiDetails-Setup-0.2.1.exe`
+- `dist/BC3MultiDetails-Setup-0.2.2.exe`
 
 本次最终构建 SHA-256 见 `docs/TEST_REPORT.md`。

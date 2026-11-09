@@ -19,10 +19,14 @@ static InlineDetour g_click_detour;
 static InlineDetour g_resize_detour;
 static InlineDetour g_line_parser_detour;
 static InlineDetour g_current_changed_detour;
+static InlineDetour g_line_callback_detour;
+static InlineDetour g_item_callback_detour;
 void *g_click_trampoline;
 void *g_resize_trampoline;
 void *g_line_parser_trampoline;
 void *g_current_changed_trampoline;
+void *g_line_callback_trampoline;
+void *g_item_callback_trampoline;
 static void *g_click_frame;
 static void *g_click_sender;
 static void *g_resize_frame;
@@ -159,6 +163,51 @@ __attribute__((naked)) static void editor_current_changed_hook(void) {
         "ret\n\t");
 }
 
+/* The item-style callback is stored outside the data-source interface.  Map
+   its local proxy item before the native callback reads TextContent, so both
+   native paths address the same original comparison row. */
+__attribute__((naked)) static void editor_item_callback_hook(void) {
+    __asm__ __volatile__(
+        "pushl %ebx\n\t"
+        "pushl %esi\n\t"
+        "pushl %edi\n\t"
+        "movl %eax, %ebx\n\t"
+        "movl %edx, %esi\n\t"
+        "movl %ecx, %edi\n\t"
+        "pushl %esi\n\t"
+        "pushl %ebx\n\t"
+        "call _multidetails_map_proxy_item\n\t"
+        "addl $8, %esp\n\t"
+        "movl %eax, %edx\n\t"
+        "movl %ebx, %eax\n\t"
+        "movl %edi, %ecx\n\t"
+        "call *_g_item_callback_trampoline\n\t"
+        "movl %eax, %edx\n\t"
+        "popl %edi\n\t"
+        "popl %esi\n\t"
+        "popl %ebx\n\t"
+        "movl %edx, %eax\n\t"
+        "ret\n\t");
+}
+
+/* The full-line style callback carries its item as the fifth stack
+   argument.  Translate that caller-owned argument in place, then tail-jump
+   into BC3 so its native callee still sees the original stack layout and
+   performs the original ret $0x18 cleanup. */
+__attribute__((naked)) static void editor_line_callback_hook(void) {
+    __asm__ __volatile__(
+        "pushfl\n\t"
+        "pushal\n\t"
+        "pushl 56(%esp)\n\t"
+        "pushl %eax\n\t"
+        "call _multidetails_map_proxy_item\n\t"
+        "addl $8, %esp\n\t"
+        "movl %eax, 56(%esp)\n\t"
+        "popal\n\t"
+        "popfl\n\t"
+        "jmp *_g_line_callback_trampoline\n\t");
+}
+
 __attribute__((naked)) static void details_resize_hook(void) {
     __asm__ __volatile__(
         "pushfl\n\t"
@@ -189,6 +238,12 @@ static BOOL install_hooks(void) {
     };
     static const uint8_t current_changed_expected[8] = {
         0x55, 0x8b, 0xec, 0x83, 0xc4, 0xec, 0x53, 0x56
+    };
+    static const uint8_t item_callback_expected[6] = {
+        0x53, 0x56, 0x57, 0x51, 0x8b, 0xf9
+    };
+    static const uint8_t line_callback_expected[6] = {
+        0x55, 0x8b, 0xec, 0x51, 0x53, 0x56
     };
     uint8_t *base = g_bc3.module_base;
     if (!detour_install(&g_line_parser_detour,
@@ -224,11 +279,44 @@ static BOOL install_hooks(void) {
     }
     g_current_changed_trampoline =
         g_current_changed_detour.trampoline;
+    if (!detour_install(&g_line_callback_detour,
+                        base + BC3_RVA_EDITOR_LINE_CALLBACK,
+                        editor_line_callback_hook,
+                        sizeof(line_callback_expected),
+                        line_callback_expected)) {
+        log_line("Editor line callback hook verification/install failed");
+        detour_remove(&g_current_changed_detour);
+        detour_remove(&g_click_detour);
+        detour_remove(&g_line_parser_detour);
+        g_current_changed_trampoline = NULL;
+        g_click_trampoline = NULL;
+        g_line_parser_trampoline = NULL;
+        return FALSE;
+    }
+    g_line_callback_trampoline = g_line_callback_detour.trampoline;
+    if (!detour_install(&g_item_callback_detour,
+                        base + BC3_RVA_EDITOR_ITEM_CALLBACK,
+                        editor_item_callback_hook,
+                        sizeof(item_callback_expected),
+                        item_callback_expected)) {
+        log_line("Editor item callback hook verification/install failed");
+        detour_remove(&g_line_callback_detour);
+        detour_remove(&g_current_changed_detour);
+        detour_remove(&g_click_detour);
+        detour_remove(&g_line_parser_detour);
+        g_current_changed_trampoline = NULL;
+        g_click_trampoline = NULL;
+        g_line_parser_trampoline = NULL;
+        return FALSE;
+    }
+    g_item_callback_trampoline = g_item_callback_detour.trampoline;
     if (!detour_install(&g_resize_detour,
                         base + BC3_RVA_DETAILS_PANEL_RESIZE,
                         details_resize_hook, sizeof(resize_expected),
                         resize_expected)) {
         log_line("DetailsPanelResize hook verification/install failed");
+        detour_remove(&g_item_callback_detour);
+        detour_remove(&g_line_callback_detour);
         detour_remove(&g_current_changed_detour);
         detour_remove(&g_click_detour);
         detour_remove(&g_line_parser_detour);
@@ -271,6 +359,8 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
         if (thread) CloseHandle(thread);
     } else if (reason == DLL_PROCESS_DETACH && !reserved) {
         detour_remove(&g_resize_detour);
+        detour_remove(&g_item_callback_detour);
+        detour_remove(&g_line_callback_detour);
         detour_remove(&g_current_changed_detour);
         detour_remove(&g_click_detour);
         detour_remove(&g_line_parser_detour);

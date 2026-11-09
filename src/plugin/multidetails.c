@@ -99,19 +99,10 @@ __attribute__((naked)) static int proxy_get_count(void) {
         "ret\n\t");
 }
 
-/* The main and detail editors share one underlying comparison model. BC3
-   normally detects that by source-object identity. The selected-row proxy is
-   a second read-only view of that same model, so delegating its lock/unlock
-   methods would recursively acquire the model lock during a main-editor
-   click. The outer native operation already owns the required lock. */
-__attribute__((naked)) static void proxy_lock_noop(void) {
-    __asm__ __volatile__("ret\n\t");
-}
-
 #define DEFINE_MAP_THUNK(name, byte_offset)                              \
     __attribute__((naked)) static void name(void) {                      \
         __asm__ __volatile__(                                            \
-            "testl %ecx, %ecx\n\t"                                      \
+            "testl %ecx, %ecx\n\t"                                     \
             "js 1f\n\t"                                                \
             "cmpl 8(%eax), %ecx\n\t"                                   \
             "jae 1f\n\t"                                               \
@@ -372,8 +363,11 @@ static void initialize_proxy_vtable(void *source) {
     g_source_proxy_vtable[8] = proxy_method_08;
     g_source_proxy_vtable[9] = proxy_method_09;
     g_source_proxy_vtable[12] = proxy_method_12;
-    g_source_proxy_vtable[15] = proxy_lock_noop;
-    g_source_proxy_vtable[16] = proxy_lock_noop;
+    /* Keep the model's native read lock/unlock pair (slots 15 and 16).
+       Painting can overlap BC3's background comparison worker on Windows;
+       bypassing this pair can expose a half-updated item array to the detail
+       editor.  Both methods only dereference source->owner, which the proxy
+       preserves at offset 4. */
     g_source_proxy_vtable[17] = proxy_method_17;
     g_source_proxy_vtable[18] = proxy_method_18;
     g_source_proxy_vtable[19] = proxy_method_19;
@@ -424,6 +418,7 @@ static void ensure_window_hooks(ViewState *view) {
 
 static BOOL ensure_view(ViewState *view) {
     void *detail;
+    void *observed_source;
     int side;
     if (!view || !view->frame) return FALSE;
     view->panel_object = bc3_frame_details_panel(view->frame);
@@ -453,15 +448,31 @@ static BOOL ensure_view(ViewState *view) {
             }
         }
     }
-    if (!view->original_source) {
-        view->original_source = bc3_editor_data_source(detail);
+    observed_source = bc3_editor_data_source(detail);
+    if (observed_source && observed_source != &view->proxy &&
+        observed_source != view->original_source) {
+        /* A comparison reload can reuse the same frame/editor while replacing
+           its TTextEditorItems instance.  Never retain the previous owner's
+           pointer: it is freed as soon as BC3 finishes rebinding the view. */
+        view->original_source = observed_source;
         view->original_item_count = bc3_editor_item_count(detail);
+        view->selection_count = 0;
+        view->anchor = -1;
+        view->active_key = -1;
+        view->proxy_active = FALSE;
         initialize_proxy_vtable(view->original_source);
         if (view->original_source && g_source_vtable_ready) {
             view->proxy.vtable = g_source_proxy_vtable;
             view->proxy.owner =
                 *(void **)((uint8_t *)view->original_source + 4);
         }
+    } else if (observed_source == view->original_source &&
+               view->original_source) {
+        /* The interface wrapper is usually stable, but its model owner may be
+           replaced by an in-place session reload. */
+        view->original_item_count = bc3_editor_item_count(detail);
+        view->proxy.owner =
+            *(void **)((uint8_t *)view->original_source + 4);
     }
     ensure_message_window(view);
     ensure_window_hooks(view);
@@ -536,6 +547,11 @@ static void invalidate_native_editors(ViewState *view) {
     }
     for (side = 0; side < 2; ++side) {
         if (view->marker_window[side])
+            /* This native window has no background brush of its own.  Asking
+               Win32 to erase it exposes an unpainted black rectangle between
+               BC3's row-level paint passes.  The native current-item setter
+               already invalidates the old and new row geometry; this broad
+               refresh only needs to schedule paint without erasure. */
             InvalidateRect(view->marker_window[side], NULL, FALSE);
     }
 }
@@ -671,6 +687,12 @@ static void apply_proxy_source(ViewState *view) {
         g_bc3.set_data_source(editor, NULL);
         g_bc3.set_data_source(editor, &view->proxy);
         log_line("Native detail side %d source rebound", side);
+        /* SetDataSource has already rebuilt the native editor caches.  Do not
+           run the public current-item transaction here: its callback and
+           selection walk address the frame's original TextContent rows, but
+           active_proxy_item is a local proxy coordinate.  The transaction is
+           used for main-editor synchronization below, where the coordinate
+           is native. */
         bc3_editor_override_current_item(editor, active_proxy_item);
         log_line("Native detail side %d current item set", side);
         bc3_editor_override_top_item(editor, 0);
@@ -779,11 +801,32 @@ static void sync_detail_horizontal(ViewState *view, int source_side) {
     view->syncing = FALSE;
 }
 
+static void sync_main_current(ViewState *view, void *sender,
+                              int original_item) {
+    BOOL was_syncing;
+    int side;
+    if (!view || original_item < 0) return;
+    was_syncing = view->syncing;
+    view->syncing = TRUE;
+    for (side = 0; side < 2; ++side) {
+        void *editor = bc3_frame_main_editor(view->frame, side);
+        if (!editor || editor == sender ||
+            original_item >= bc3_editor_item_count(editor)) {
+            continue;
+        }
+        /* Use BC3's native setters.  Besides the logical item, these update
+           the visual-row/caret caches and invalidate the old and new item
+           ranges.  Writing core+0x2ac directly leaves the current-row frame
+           at a stale Y coordinate after scrolling, wrapping, or resize. */
+        g_bc3.set_cur_item(editor, original_item);
+    }
+    view->syncing = was_syncing;
+}
+
 static void sync_upper_from_detail(ViewState *view, int detail_side) {
     void *detail;
     int proxy_item;
     int original_item;
-    int side;
     if (!view || view->syncing || !view->proxy_active) return;
     detail = bc3_frame_detail_editor(view->frame, detail_side);
     if (!detail) return;
@@ -793,16 +836,7 @@ static void sync_upper_from_detail(ViewState *view, int detail_side) {
     log_line("Native detail item %d maps to original item %d",
              proxy_item, original_item);
     view->active_key = original_item;
-    view->syncing = TRUE;
-    for (side = 0; side < MAX_EDITOR_SIDES; ++side) {
-        void *editor = bc3_frame_main_editor(view->frame, side);
-        HWND inner;
-        if (!editor) continue;
-        g_bc3.set_cur_item(editor, original_item);
-        inner = editor_inner_window(editor);
-        if (inner) InvalidateRect(inner, NULL, FALSE);
-    }
-    view->syncing = FALSE;
+    sync_main_current(view, NULL, original_item);
     /* Updating the upper current items can move Win32 focus back to a main
        editor.  Return it to the native detail window that owns the caret so
        Home/End, drag selection, and Ctrl+C continue in the clicked row. */
@@ -866,7 +900,7 @@ BOOL multidetails_is_internal_update(void) {
 BOOL multidetails_before_click(void *frame, void *sender) {
     ViewState *view;
     void *model;
-    SelectionWork work;
+    int key;
     int side;
     int flags = 0;
     if (g_internal_update || !frame) return FALSE;
@@ -881,28 +915,23 @@ BOOL multidetails_before_click(void *frame, void *sender) {
                    sender != bc3_frame_main_editor(frame, 1))) {
         return FALSE;
     }
-    ZeroMemory(&work, sizeof(work));
-    work.source_count = bc3_editor_item_count(model);
-    work.key = g_bc3.get_cur_item(model);
-    if (work.key < 0 || work.key >= work.source_count) return FALSE;
+    key = g_bc3.get_cur_item(model);
+    if (key < 0 || key >= bc3_editor_item_count(model)) return FALSE;
     if ((GetKeyState(VK_CONTROL) & 0x8000) != 0)
         flags |= SELECTION_CONTROL;
     if ((GetKeyState(VK_SHIFT) & 0x8000) != 0)
         flags |= SELECTION_SHIFT;
-    work.flags = flags;
-    work.sequence = InterlockedIncrement(&view->sequence);
-    work.first = work.key;
-    work.last = work.key;
-    bc3_editor_physical_line_bounds(model, work.key,
-                                    &work.first, &work.last);
-    log_line("Applying native main click key=%d flags=%d",
-             work.key, flags);
-    apply_selection_result(view, &work);
+    log_line("Queueing native main click key=%d flags=%d", key, flags);
+    /* This hook runs while BC3's main editor still owns the comparison-model
+       read lock.  Rebinding the detail editors here either recurses into the
+       same non-recursive lock or forces the proxy to paint without locking.
+       Post the work so the frame click unwinds first; the proxy can then use
+       the model's real lock/unlock pair on every native paint/caret request. */
+    queue_selection(view, key, flags);
     view->suppress_main_click = TRUE;
     /* The main TUiEditorWindow has already updated its native current row.
-       Skip BC3's original frame-level click handler, whose only relevant
-       work here is rebuilding the one-row detail view that this extension
-       has just replaced with the multi-row native source. */
+       Skip BC3's frame-level handler so it cannot schedule a competing
+       one-row detail rebuild before the queued multi-row bind runs. */
     return TRUE;
 }
 
@@ -945,36 +974,79 @@ void multidetails_on_click(void *frame, void *sender) {
 
 BOOL multidetails_on_current_changed(void *frame, void *sender) {
     ViewState *view;
+    int detail_side;
     int side;
     int key;
+    int caret_x;
     int left_length;
     int right_length;
     if (!frame || !sender) return FALSE;
     view = view_find(frame, TRUE);
     if (!view || !ensure_view(view)) return FALSE;
+    if (view->syncing) {
+        /* A native setter invoked by this module must still complete its
+           internal geometry/cache transaction, but its frame-level callback
+           must not fan the original item index back into the proxy editors. */
+        return TRUE;
+    }
     for (side = 0; side < 2; ++side) {
         if (sender == bc3_frame_main_editor(frame, side)) break;
     }
-    if (side >= 2) return FALSE;
+    if (side < 2) {
+        key = g_bc3.get_cur_item(sender);
+        if (key < 0) return FALSE;
+        left_length = bc3_editor_underlying_line_length(sender, key, 0);
+        right_length = bc3_editor_underlying_line_length(sender, key, 1);
+        if (left_length <= 4096 && right_length <= 4096 &&
+            !view->proxy_active) {
+            return FALSE;
+        }
+        sync_main_current(view, sender, key);
+        log_line("Native upper current item synchronized without proxy fan-out: %d",
+                 key);
+        return TRUE;
+    }
+
+    if (!view->proxy_active) return FALSE;
+    for (detail_side = 0; detail_side < MAX_EDITOR_SIDES;
+         ++detail_side) {
+        if (sender == bc3_frame_detail_editor(frame, detail_side)) break;
+    }
+    if (detail_side >= MAX_EDITOR_SIDES) return FALSE;
     key = g_bc3.get_cur_item(sender);
-    if (key < 0) return FALSE;
-    left_length = bc3_editor_underlying_line_length(sender, key, 0);
-    right_length = bc3_editor_underlying_line_length(sender, key, 1);
-    if (left_length <= 4096 && right_length <= 4096 && !view->syncing)
-        return FALSE;
+    if (key < 0 || key >= view->proxy.count) return TRUE;
+    caret_x = g_bc3.get_caret_x(sender);
+    view->active_key = view->proxy.map[key];
     view->syncing = TRUE;
-    for (side = 0; side < 2; ++side) {
-        void *editor = bc3_frame_main_editor(frame, side);
-        HWND inner;
-        if (!editor) continue;
-        bc3_editor_override_current_item(editor, key);
-        inner = editor_inner_window(editor);
-        if (inner) InvalidateRect(inner, NULL, FALSE);
+    for (side = 0; side < MAX_EDITOR_SIDES; ++side) {
+        void *editor = bc3_frame_detail_editor(frame, side);
+        if (!editor || editor == sender) continue;
+        g_bc3.set_cur_item(editor, key);
+        if (caret_x >= 0) g_bc3.set_caret_x(editor, caret_x);
     }
     view->syncing = FALSE;
-    log_line("Skipped native single-row CurrentChanged for long item %d",
-             key);
+    sync_main_current(view, NULL, view->active_key);
+    log_line("Native proxy item %d synchronized to original item %d",
+             key, view->active_key);
     return TRUE;
+}
+
+int multidetails_map_proxy_item(void *core, int item) {
+    void *source;
+    int view_index;
+    if (!core || item < 0) return item;
+    source = *(void **)((uint8_t *)core + 0x310);
+    for (view_index = 0; view_index < MAX_VIEWS; ++view_index) {
+        ViewState *view = &g_views[view_index];
+        if (!view->frame || !view->proxy_active) {
+            continue;
+        }
+        if (source != &view->proxy) continue;
+        if (item < view->proxy.count)
+            return view->proxy.map[item];
+        return item;
+    }
+    return item;
 }
 
 void multidetails_on_details_resize(void *frame) {

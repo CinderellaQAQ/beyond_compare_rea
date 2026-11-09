@@ -8,6 +8,8 @@
 
 Bc3Api g_bc3;
 
+void *g_raw_get_caret_x;
+void *g_raw_set_caret_x;
 void *g_raw_get_cur_item;
 void *g_raw_set_cur_item;
 void *g_raw_get_x_count;
@@ -22,6 +24,23 @@ void *g_raw_execute_command;
 void *g_raw_set_control_height;
 void *g_raw_current_changed;
 void *g_raw_source_line_category;
+
+__attribute__((naked)) static int call_get_caret_x(
+    void *editor __attribute__((unused))) {
+    __asm__ __volatile__(
+        "movl 4(%esp), %eax\n\t"
+        "call *_g_raw_get_caret_x\n\t"
+        "ret\n\t");
+}
+
+__attribute__((naked)) static void call_set_caret_x(
+    void *editor __attribute__((unused)), int x __attribute__((unused))) {
+    __asm__ __volatile__(
+        "movl 4(%esp), %eax\n\t"
+        "movl 8(%esp), %edx\n\t"
+        "call *_g_raw_set_caret_x\n\t"
+        "ret\n\t");
+}
 
 __attribute__((naked)) static int call_get_cur_item(
     void *editor __attribute__((unused))) {
@@ -38,15 +57,6 @@ __attribute__((naked)) static void call_set_cur_item(
         "movl 8(%esp), %edx\n\t"
         "call *_g_raw_set_cur_item\n\t"
         "ret\n\t");
-}
-
-static void set_cached_caret_x(void *editor, int x) {
-    void *core;
-    if (!editor) return;
-    core = *(void **)((uint8_t *)editor + 0x280);
-    if (!core) return;
-    if (x < 0) x = 0;
-    *(int *)((uint8_t *)core + 0x2a8) = x;
 }
 
 __attribute__((naked)) static int call_get_x_count(
@@ -193,6 +203,8 @@ BOOL bc3_target_initialize(void) {
         return FALSE;
     }
     g_bc3.module_base = base;
+    g_raw_get_caret_x = base + BC3_RVA_EDITOR_GET_CARET_X;
+    g_raw_set_caret_x = base + BC3_RVA_EDITOR_SET_CARET_X;
     g_raw_get_cur_item = base + BC3_RVA_EDITOR_GET_CUR_ITEM;
     g_raw_set_cur_item = base + BC3_RVA_EDITOR_SET_CUR_ITEM;
     g_raw_get_x_count = base + BC3_RVA_EDITOR_GET_X_COUNT;
@@ -210,9 +222,10 @@ BOOL bc3_target_initialize(void) {
     g_raw_current_changed = base + BC3_RVA_EDITOR_CUR_CHANGED;
     g_raw_source_line_category =
         base + BC3_RVA_SOURCE_LINE_CATEGORY;
+    g_bc3.get_caret_x = call_get_caret_x;
+    g_bc3.set_caret_x = call_set_caret_x;
     g_bc3.get_cur_item = call_get_cur_item;
     g_bc3.set_cur_item = call_set_cur_item;
-    g_bc3.set_caret_x = set_cached_caret_x;
     g_bc3.get_x_count = call_get_x_count;
     g_bc3.get_left_x = call_get_left_x;
     g_bc3.set_left_x = call_set_left_x;

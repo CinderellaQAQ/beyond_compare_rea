@@ -12,6 +12,10 @@ enum {
     BC3_RVA_DETAILS_PANEL_RESIZE = 0x006661a8,
     BC3_RVA_EDITOR_CLICK         = 0x0066f44c,
     BC3_RVA_EDITOR_CUR_CHANGED   = 0x0066f470,
+    BC3_RVA_EDITOR_LINE_CALLBACK = 0x002588d8,
+    BC3_RVA_EDITOR_ITEM_CALLBACK = 0x00258990,
+    BC3_RVA_EDITOR_GET_CARET_X   = 0x0025eeb8,
+    BC3_RVA_EDITOR_SET_CARET_X   = 0x0025eec4,
     BC3_RVA_EDITOR_GET_CUR_ITEM  = 0x0025eef0,
     BC3_RVA_EDITOR_SET_CUR_ITEM  = 0x0025ef00,
     BC3_RVA_EDITOR_GET_X_COUNT   = 0x0025ef48,
@@ -37,9 +41,10 @@ enum {
 
 typedef struct Bc3Api {
     uint8_t *module_base;
+    int (__cdecl *get_caret_x)(void *editor);
+    void (__cdecl *set_caret_x)(void *editor, int x);
     int (__cdecl *get_cur_item)(void *editor);
     void (__cdecl *set_cur_item)(void *editor, int item);
-    void (__cdecl *set_caret_x)(void *editor, int x);
     int (__cdecl *get_x_count)(void *editor);
     int (__cdecl *get_left_x)(void *editor);
     void (__cdecl *set_left_x)(void *editor, int x);
