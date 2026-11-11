@@ -12,7 +12,7 @@
 #include "resource.h"
 
 #define PRODUCT_NAME L"BC3 MultiDetails"
-#define PRODUCT_VERSION L"0.2.2"
+#define PRODUCT_VERSION L"0.2.3"
 #define TARGET_EXE L"BCompare.exe"
 #define PLUGIN_NAME L"version.dll"
 #define UNINSTALLER_NAME L"BC3MultiDetailsUninstall.exe"
@@ -40,8 +40,8 @@ static const BYTE target_sha256[32] = {
     0x72, 0xe9, 0xf5, 0x62, 0x28, 0x0a, 0xe8, 0x45
 };
 
-/* Exact v0.2.0 and v0.2.1 release artifacts.  These are the only
-   pre-existing files that the v0.2.2 installer may replace. */
+/* Exact previous release artifacts.  These are the only pre-existing files
+   that the v0.2.3 installer may replace. */
 static const BYTE v020_plugin_sha256[32] = {
     0x2f, 0x74, 0x88, 0x93, 0x2c, 0x86, 0xa2, 0x6d,
     0x91, 0x07, 0x8b, 0x1c, 0x26, 0x79, 0x1e, 0x9e,
@@ -68,6 +68,20 @@ static const BYTE v021_setup_sha256[32] = {
     0x8c, 0x4e, 0x4d, 0x0b, 0x4f, 0xb4, 0x7a, 0x3f,
     0x36, 0x5c, 0x06, 0xc4, 0x0b, 0x4f, 0xe7, 0x7b,
     0x1d, 0x15, 0x24, 0xb3, 0x55, 0x5f, 0x2a, 0xcd
+};
+
+static const BYTE v022_plugin_sha256[32] = {
+    0x0e, 0x8d, 0x1b, 0x53, 0x9c, 0xed, 0x77, 0x50,
+    0x7b, 0x6d, 0xe9, 0x97, 0xb4, 0xef, 0x5e, 0x4d,
+    0x6c, 0x18, 0x4f, 0xdc, 0x73, 0xae, 0x56, 0x0c,
+    0x82, 0x29, 0x96, 0x90, 0x67, 0x15, 0x20, 0x9e
+};
+
+static const BYTE v022_setup_sha256[32] = {
+    0x39, 0x5a, 0xdf, 0x29, 0xbd, 0x5a, 0xd5, 0xe1,
+    0x64, 0x96, 0xd3, 0x8f, 0x26, 0xd1, 0x86, 0xad,
+    0x2d, 0x93, 0x9f, 0x7f, 0x60, 0xc0, 0xde, 0x4d,
+    0x81, 0x93, 0xc9, 0xf1, 0x07, 0x91, 0xfb, 0x67
 };
 
 static HINSTANCE instance_handle;
@@ -264,7 +278,8 @@ static BOOL write_plugin(const WCHAR *directory, WCHAR *message,
     if (file_exists(destination)) {
         if (file_matches_memory(destination, data, size)) return TRUE;
         if (file_has_sha256(destination, v020_plugin_sha256) ||
-            file_has_sha256(destination, v021_plugin_sha256)) {
+            file_has_sha256(destination, v021_plugin_sha256) ||
+            file_has_sha256(destination, v022_plugin_sha256)) {
             replace_existing = TRUE;
         } else {
             lstrcpynW(message,
@@ -355,7 +370,8 @@ static BOOL write_uninstaller(const WCHAR *directory) {
     if (file_exists(destination)) {
         if (files_equal(source, destination)) return TRUE;
         if (!file_has_sha256(destination, v020_setup_sha256) &&
-            !file_has_sha256(destination, v021_setup_sha256)) {
+            !file_has_sha256(destination, v021_setup_sha256) &&
+            !file_has_sha256(destination, v022_setup_sha256)) {
             SetLastError(ERROR_ALREADY_EXISTS);
             return FALSE;
         }

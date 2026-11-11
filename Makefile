@@ -18,7 +18,7 @@ PLUGIN_SRC := src/plugin/version_proxy.c src/plugin/bc3_target.c \
 BUILD_DIR := build
 DIST_DIR := dist
 PLUGIN_DLL := $(DIST_DIR)/version.dll
-SETUP_EXE := $(DIST_DIR)/BC3MultiDetails-Setup-0.2.2.exe
+SETUP_EXE := $(DIST_DIR)/BC3MultiDetails-Setup-0.2.3.exe
 
 CFLAGS := $(TOOLCHAIN_CFLAGS) -Os -Wall -Wextra -ffunction-sections \
 	-fdata-sections -DUNICODE -D_UNICODE

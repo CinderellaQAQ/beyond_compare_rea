@@ -1,0 +1,66 @@
+name: Publish BC3 MultiDetails v0.2.3
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    if: github.event.head_commit.message == 'Publish v0.2.3 release'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out release payload
+        uses: actions/checkout@v4
+
+      - name: Verify installer
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "b58baf7ec36ebad51f1fb831436a28d7d1e2f603cf4a5ba5c9abd58dd1726231  dist/BC3MultiDetails-Setup-0.2.3.exe" |
+            sha256sum --check --strict
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create v0.2.3 \
+            "dist/BC3MultiDetails-Setup-0.2.3.exe#Windows 安装程序" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --target "${GITHUB_SHA}" \
+            --title "BC3 MultiDetails v0.2.3" \
+            --latest \
+            --notes-file docs/RELEASE_NOTES_0.2.3.md
+
+      - name: Remove temporary release payload
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset_sha="$(gh api "repos/${GITHUB_REPOSITORY}/contents/dist/BC3MultiDetails-Setup-0.2.3.exe?ref=main" --jq '.sha')"
+          gh api --method DELETE \
+            "repos/${GITHUB_REPOSITORY}/contents/dist/BC3MultiDetails-Setup-0.2.3.exe" \
+            -f message='Remove temporary v0.2.3 release payload' \
+            -f sha="${asset_sha}" \
+            -f branch=main
+
+      - name: Remove one-time workflow
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          workflow_sha="$(gh api "repos/${GITHUB_REPOSITORY}/contents/.github/workflows/publish-v0.2.3.yml?ref=main" --jq '.sha')"
+          gh api --method DELETE \
+            "repos/${GITHUB_REPOSITORY}/contents/.github/workflows/publish-v0.2.3.yml" \
+            -f message='Remove one-time v0.2.3 publisher' \
+            -f sha="${workflow_sha}" \
+            -f branch=main

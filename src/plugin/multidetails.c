@@ -627,64 +627,84 @@ static void restore_original_source(ViewState *view) {
     view->syncing = FALSE;
 }
 
-static int build_proxy_map(ViewState *view) {
+static int build_proxy_map(const ViewState *view, int *map, int capacity) {
     int selection_index_value;
     int count = 0;
     for (selection_index_value = 0;
          selection_index_value < view->selection_count;
          ++selection_index_value) {
         int item;
-        SelectedRange *selection =
+        const SelectedRange *selection =
             &view->selections[selection_index_value];
         for (item = selection->first; item <= selection->last; ++item) {
-            if (count >= MAX_PROXY_ITEMS) {
+            if (count >= capacity) {
                 log_line("Native selected-row view capped at %d internal items",
-                         MAX_PROXY_ITEMS);
+                         capacity);
                 return count;
             }
-            view->proxy.map[count++] = item;
+            map[count++] = item;
         }
     }
     return count;
 }
 
-static int proxy_index_for_original(const ViewState *view, int item) {
+static int proxy_index_for_original(const int *map, int count, int item) {
     int index;
-    for (index = 0; index < view->proxy.count; ++index) {
-        if (view->proxy.map[index] == item) return index;
+    for (index = 0; index < count; ++index) {
+        if (map[index] == item) return index;
     }
     return 0;
 }
 
 static void apply_proxy_source(ViewState *view) {
+    int pending_map[MAX_PROXY_ITEMS];
+    int pending_count;
     int side;
     int active_proxy_item;
     int shared_left_x = 0;
     if (!ensure_view(view)) return;
-    view->proxy.count = build_proxy_map(view);
+    pending_count = build_proxy_map(view, pending_map, MAX_PROXY_ITEMS);
     log_line("Applying native selected-row source: %d item(s)",
-             view->proxy.count);
-    if (view->proxy.count <= 0) {
+             pending_count);
+    if (pending_count <= 0) {
+        /* Restore while the old map still exists so the current proxy row can
+           be translated back to its original comparison row. */
         restore_original_source(view);
         update_native_layout(view, TRUE);
         invalidate_native_editors(view);
         return;
     }
-    active_proxy_item = proxy_index_for_original(view, view->active_key);
+    active_proxy_item = proxy_index_for_original(
+        pending_map, pending_count, view->active_key);
     view->syncing = TRUE;
+
+    /* First detach every detail editor.  The proxy object has a stable
+       address, so changing its map while another editor is still bound lets
+       native paint/caret callbacks observe a new count with the old caches. */
     for (side = 0; side < MAX_EDITOR_SIDES; ++side) {
         void *editor = bc3_frame_detail_editor(view->frame, side);
         if (!editor) continue;
         if (side == 0) shared_left_x = g_bc3.get_left_x(editor);
-        log_line("Binding native detail side %d", side);
         g_bc3.set_option(editor, EDITOR_OPTION_SELECTION, TRUE);
         g_bc3.set_option(editor, EDITOR_OPTION_SINGLE_ROW, FALSE);
-        /* SetDataSource clears TUiEditorWindow's cached item/scroll bounds
-           and asks the proxy for its new count.  A raw pointer/count write
-           leaves max-top and visible-range caches stale, which asserts as
-           soon as the user clicks proxy row 1 or later.  Detach first
-           because the proxy address itself is stable while its map changes. */
         g_bc3.set_data_source(editor, NULL);
+    }
+
+    memcpy(view->proxy.map, pending_map,
+           (size_t)pending_count * sizeof(pending_map[0]));
+    view->proxy.count = pending_count;
+
+    /* SetDataSource synchronously calls CurrentChanged and both native style
+       callbacks.  Publish the active state before the first bind so those
+       callbacks translate local proxy coordinates instead of feeding them
+       back into the shorter proxy as original comparison coordinates. */
+    view->proxy_active = TRUE;
+    for (side = 0; side < MAX_EDITOR_SIDES; ++side) {
+        void *editor = bc3_frame_detail_editor(view->frame, side);
+        if (!editor) continue;
+        log_line("Binding native detail side %d", side);
+        /* SetDataSource rebuilds the native editor's item/scroll caches from
+           the already-published proxy count. */
         g_bc3.set_data_source(editor, &view->proxy);
         log_line("Native detail side %d source rebound", side);
         /* SetDataSource has already rebuilt the native editor caches.  Do not
@@ -698,7 +718,6 @@ static void apply_proxy_source(ViewState *view) {
         bc3_editor_override_top_item(editor, 0);
         log_line("Native detail side %d top item set", side);
     }
-    view->proxy_active = TRUE;
     update_native_layout(view, FALSE);
     for (side = 0; side < MAX_EDITOR_SIDES; ++side) {
         void *editor = bc3_frame_detail_editor(view->frame, side);
@@ -1038,7 +1057,7 @@ int multidetails_map_proxy_item(void *core, int item) {
     source = *(void **)((uint8_t *)core + 0x310);
     for (view_index = 0; view_index < MAX_VIEWS; ++view_index) {
         ViewState *view = &g_views[view_index];
-        if (!view->frame || !view->proxy_active) {
+        if (!view->frame) {
             continue;
         }
         if (source != &view->proxy) continue;

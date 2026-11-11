@@ -4,7 +4,7 @@
 Text Details 面板。
 
 当前 GitHub 正式版：
-[BC3MultiDetails-Setup-0.2.2.exe](https://github.com/CinderellaQAQ/beyond_compare_rea/releases/latest/download/BC3MultiDetails-Setup-0.2.2.exe)。
+[BC3MultiDetails-Setup-0.2.3.exe](https://github.com/CinderellaQAQ/beyond_compare_rea/releases/latest/download/BC3MultiDetails-Setup-0.2.3.exe)。
 
 ## 效果
 
@@ -54,13 +54,13 @@ Software 官网目前只公开提供 BC3 最终版 3.3.13，以下 3.3.5 安装�
 ## 安装
 
 1. 关闭所有 `BCompare.exe` 进程。
-2. 运行 `BC3MultiDetails-Setup-0.2.2.exe`。
+2. 运行 `BC3MultiDetails-Setup-0.2.3.exe`。
 3. 选择含有 `BCompare.exe` 的 Beyond Compare 3 安装目录，然后点击 **Install**。
 4. 重新启动 Beyond Compare，打开 Text Compare 会话。
 
-若已经安装本项目发布的 0.2.0 或 0.2.1，可直接运行 0.2.2 原地升级，无需先
-卸载。升级器只会替换 SHA-256 精确匹配这两个正式版本的 DLL 与卸载器；未知
-`version.dll` 仍会被安全保留并中止安装。
+若已经安装本项目发布的 0.2.0、0.2.1 或 0.2.2，可直接运行 0.2.3 原地升级，
+无需先卸载。升级器只会替换 SHA-256 精确匹配这些正式版本的 DLL 与卸载器；
+未知 `version.dll` 仍会被安全保留并中止安装。
 
 安装器请求管理员权限是因为默认安装位置通常位于 Program Files。它不包含
 Beyond Compare 的任何程序文件，也不会修改 `BCompare.exe`。
@@ -71,6 +71,16 @@ Beyond Compare 的任何程序文件，也不会修改 `BCompare.exe`。
 - SHA-256：`1d822b3faabb8f65fc30076d32a95757a2c369ccb64ae54572e9f562280ae845`
 
 若目标目录已有其他 `version.dll`，安装会安全中止，不覆盖该文件。
+
+## 0.2.3 数据源绑定崩溃修复
+
+- 修复原生 `SetDataSource` 绑定代理期间，代理尚未标记为活动，导致同步触发的
+  当前行和样式回调把局部行号当成原始行号的问题。
+- 代理映射改为两阶段更新：先让全部底部编辑器脱离旧代理，再一次性发布新的
+  行映射和活动状态，最后统一重绑，避免新映射与旧编辑器缓存短暂混用。
+- 取消最后一条选择时，先使用旧映射恢复原始行，再清空代理。
+- 已在原本稳定复现 0.2.2 错误的环境、独立冷启动环境和 150% DPI 环境通过；
+  三条 10,001 字符差异、横向滚动、底部点击回跳与完整复制均已复测。
 
 ## 0.2.2 应用错误修复
 
@@ -167,6 +177,7 @@ make CC=/path/to/i686-w64-mingw32-gcc \
 输出：
 
 - `dist/version.dll`
-- `dist/BC3MultiDetails-Setup-0.2.2.exe`
+- `dist/BC3MultiDetails-Setup-0.2.3.exe`
 
-本次最终构建 SHA-256 见 `docs/TEST_REPORT.md`。
+0.2.3 正式构建 SHA-256 与回归记录见 `docs/TEST_REPORT_0.2.3.md`；0.2.2 的
+发布记录见 `docs/TEST_REPORT.md`。
