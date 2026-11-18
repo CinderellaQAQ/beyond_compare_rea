@@ -12,7 +12,7 @@
 #include "resource.h"
 
 #define PRODUCT_NAME L"BC3 MultiDetails"
-#define PRODUCT_VERSION L"0.2.3"
+#define PRODUCT_VERSION L"0.2.4"
 #define TARGET_EXE L"BCompare.exe"
 #define PLUGIN_NAME L"version.dll"
 #define UNINSTALLER_NAME L"BC3MultiDetailsUninstall.exe"
@@ -41,7 +41,7 @@ static const BYTE target_sha256[32] = {
 };
 
 /* Exact previous release artifacts.  These are the only pre-existing files
-   that the v0.2.3 installer may replace. */
+   that the v0.2.4 installer may replace. */
 static const BYTE v020_plugin_sha256[32] = {
     0x2f, 0x74, 0x88, 0x93, 0x2c, 0x86, 0xa2, 0x6d,
     0x91, 0x07, 0x8b, 0x1c, 0x26, 0x79, 0x1e, 0x9e,
@@ -82,6 +82,20 @@ static const BYTE v022_setup_sha256[32] = {
     0x64, 0x96, 0xd3, 0x8f, 0x26, 0xd1, 0x86, 0xad,
     0x2d, 0x93, 0x9f, 0x7f, 0x60, 0xc0, 0xde, 0x4d,
     0x81, 0x93, 0xc9, 0xf1, 0x07, 0x91, 0xfb, 0x67
+};
+
+static const BYTE v023_plugin_sha256[32] = {
+    0x61, 0xa0, 0x32, 0xbb, 0xfc, 0x88, 0x0e, 0xdc,
+    0x80, 0x17, 0x4d, 0xee, 0x3f, 0x7c, 0x09, 0xab,
+    0x5d, 0x68, 0xfe, 0xec, 0x15, 0x79, 0xee, 0x96,
+    0x92, 0xe6, 0x48, 0xdb, 0xc3, 0xd3, 0x18, 0x8d
+};
+
+static const BYTE v023_setup_sha256[32] = {
+    0xb5, 0x8b, 0xaf, 0x7e, 0xc3, 0x6e, 0xba, 0xd5,
+    0x1f, 0x1f, 0xb8, 0x31, 0x43, 0x6a, 0x28, 0xd7,
+    0xd1, 0xe2, 0xf6, 0x03, 0xcf, 0x4a, 0x5b, 0xa5,
+    0xc9, 0xab, 0xd5, 0x8d, 0xd1, 0x72, 0x62, 0x31
 };
 
 static HINSTANCE instance_handle;
@@ -279,7 +293,8 @@ static BOOL write_plugin(const WCHAR *directory, WCHAR *message,
         if (file_matches_memory(destination, data, size)) return TRUE;
         if (file_has_sha256(destination, v020_plugin_sha256) ||
             file_has_sha256(destination, v021_plugin_sha256) ||
-            file_has_sha256(destination, v022_plugin_sha256)) {
+            file_has_sha256(destination, v022_plugin_sha256) ||
+            file_has_sha256(destination, v023_plugin_sha256)) {
             replace_existing = TRUE;
         } else {
             lstrcpynW(message,
@@ -371,7 +386,8 @@ static BOOL write_uninstaller(const WCHAR *directory) {
         if (files_equal(source, destination)) return TRUE;
         if (!file_has_sha256(destination, v020_setup_sha256) &&
             !file_has_sha256(destination, v021_setup_sha256) &&
-            !file_has_sha256(destination, v022_setup_sha256)) {
+            !file_has_sha256(destination, v022_setup_sha256) &&
+            !file_has_sha256(destination, v023_setup_sha256)) {
             SetLastError(ERROR_ALREADY_EXISTS);
             return FALSE;
         }

@@ -4,7 +4,7 @@
 Text Details 面板。
 
 当前 GitHub 正式版：
-[BC3MultiDetails-Setup-0.2.3.exe](https://github.com/CinderellaQAQ/beyond_compare_rea/releases/latest/download/BC3MultiDetails-Setup-0.2.3.exe)。
+[BC3MultiDetails-Setup-0.2.4.exe](https://github.com/CinderellaQAQ/beyond_compare_rea/releases/latest/download/BC3MultiDetails-Setup-0.2.4.exe)。
 
 ## 效果
 
@@ -54,11 +54,11 @@ Software 官网目前只公开提供 BC3 最终版 3.3.13，以下 3.3.5 安装�
 ## 安装
 
 1. 关闭所有 `BCompare.exe` 进程。
-2. 运行 `BC3MultiDetails-Setup-0.2.3.exe`。
+2. 运行 `BC3MultiDetails-Setup-0.2.4.exe`。
 3. 选择含有 `BCompare.exe` 的 Beyond Compare 3 安装目录，然后点击 **Install**。
 4. 重新启动 Beyond Compare，打开 Text Compare 会话。
 
-若已经安装本项目发布的 0.2.0、0.2.1 或 0.2.2，可直接运行 0.2.3 原地升级，
+若已经安装本项目发布的 0.2.0、0.2.1、0.2.2 或 0.2.3，可直接运行 0.2.4 原地升级，
 无需先卸载。升级器只会替换 SHA-256 精确匹配这些正式版本的 DLL 与卸载器；
 未知 `version.dll` 仍会被安全保留并中止安装。
 
@@ -71,6 +71,17 @@ Beyond Compare 的任何程序文件，也不会修改 `BCompare.exe`。
 - SHA-256：`1d822b3faabb8f65fc30076d32a95757a2c369ccb64ae54572e9f562280ae845`
 
 若目标目录已有其他 `version.dll`，安装会安全中止，不覆盖该文件。
+
+## 0.2.4 多行横向滚动同步修复
+
+- 修复底部共享横向滚动条只移动下半组详情行的问题。滚动条消息现在从 BC3
+  实际接收 `WM_HSCROLL` 的外层原生编辑器同步到另一侧，所有选中差异行会随
+  滑块拖动、箭头和翻页操作一起移动。
+- 在跨编辑器同步以及恢复原始数据源前，横向位置会按目标编辑器的最大范围
+  限制，避免长行执行 `End`、选择复制后退出时触发 BC3 原生断言。
+- 新增逐编辑器像素同步回归和“滚动—选择—复制—退出”异常窗口回归。
+- 已使用两个各 10,000 行的文件，同时选择三条 10,000 字符差异行验证；真实
+  拖动、完整复制和无异常退出均通过。
 
 ## 0.2.3 数据源绑定崩溃修复
 
@@ -177,7 +188,8 @@ make CC=/path/to/i686-w64-mingw32-gcc \
 输出：
 
 - `dist/version.dll`
-- `dist/BC3MultiDetails-Setup-0.2.3.exe`
+- `dist/BC3MultiDetails-Setup-0.2.4.exe`
 
-0.2.3 正式构建 SHA-256 与回归记录见 `docs/TEST_REPORT_0.2.3.md`；0.2.2 的
+0.2.4 正式构建 SHA-256 与回归记录见 `docs/TEST_REPORT_0.2.4.md`；0.2.3 的
+发布记录见 `docs/TEST_REPORT_0.2.3.md`；0.2.2 的
 发布记录见 `docs/TEST_REPORT.md`。

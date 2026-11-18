@@ -67,6 +67,8 @@ typedef struct ViewState {
     void *marker_editor[2];
     HWND detail_inner[MAX_EDITOR_SIDES];
     WNDPROC detail_inner_original[MAX_EDITOR_SIDES];
+    HWND detail_outer[MAX_EDITOR_SIDES];
+    WNDPROC detail_outer_original[MAX_EDITOR_SIDES];
 } ViewState;
 
 typedef struct SelectionWork {
@@ -281,6 +283,8 @@ static LRESULT CALLBACK marker_window_proc(HWND window, UINT message,
                                            WPARAM wparam, LPARAM lparam);
 static LRESULT CALLBACK detail_inner_proc(HWND window, UINT message,
                                           WPARAM wparam, LPARAM lparam);
+static LRESULT CALLBACK detail_outer_proc(HWND window, UINT message,
+                                          WPARAM wparam, LPARAM lparam);
 static LRESULT CALLBACK ui_message_hook(int code, WPARAM wparam,
                                         LPARAM lparam);
 
@@ -347,6 +351,20 @@ static ViewState *view_from_detail(HWND window, int *side_out) {
     return NULL;
 }
 
+static ViewState *view_from_detail_outer(HWND window, int *side_out) {
+    int view_index;
+    int side;
+    for (view_index = 0; view_index < MAX_VIEWS; ++view_index) {
+        for (side = 0; side < MAX_EDITOR_SIDES; ++side) {
+            if (g_views[view_index].detail_outer[side] == window) {
+                if (side_out) *side_out = side;
+                return &g_views[view_index];
+            }
+        }
+    }
+    return NULL;
+}
+
 static void initialize_proxy_vtable(void *source) {
     void **vtable;
     if (g_source_vtable_ready || !source) return;
@@ -397,7 +415,18 @@ static void ensure_window_hooks(ViewState *view) {
     }
     for (side = 0; side < MAX_EDITOR_SIDES; ++side) {
         void *editor = bc3_frame_detail_editor(view->frame, side);
+        HWND outer = editor ? bc3_find_control_window(editor) : NULL;
         HWND inner = editor ? editor_inner_window(editor) : NULL;
+        /* The native horizontal scrollbar is a child of TUiEditor and sends
+           WM_HSCROLL to that outer window.  The text/caret messages arrive at
+           TUiEditorWindow below it, so both levels must be observed. */
+        if (outer && (!view->detail_outer[side] ||
+                      !IsWindow(view->detail_outer[side]))) {
+            view->detail_outer[side] = outer;
+            view->detail_outer_original[side] =
+                (WNDPROC)SetWindowLongPtrW(
+                    outer, GWLP_WNDPROC, (LONG_PTR)detail_outer_proc);
+        }
         if (inner && (!view->detail_inner[side] ||
                       !IsWindow(view->detail_inner[side]))) {
             view->detail_inner[side] = inner;
@@ -556,6 +585,18 @@ static void invalidate_native_editors(ViewState *view) {
     }
 }
 
+static void set_editor_left_x_clamped(void *editor, int left_x) {
+    int max_left_x;
+    if (!editor) return;
+    max_left_x = g_bc3.get_max_left_x(editor);
+    if (max_left_x < 0) max_left_x = 0;
+    if (left_x < 0) left_x = 0;
+    if (left_x > max_left_x) left_x = max_left_x;
+    /* BC3's native setter asserts instead of clamping when the requested
+       offset exceeds the editor's freshly rebuilt data-source extent. */
+    g_bc3.set_left_x(editor, left_x);
+}
+
 static void update_native_layout(ViewState *view, BOOL reset) {
     int side;
     int rows = reset ? 1 : view->proxy.count;
@@ -621,7 +662,7 @@ static void restore_original_source(ViewState *view) {
         log_line("Native detail side %d source restored", side);
         if (original_item < bc3_editor_item_count(editor))
             g_bc3.set_cur_item(editor, original_item);
-        g_bc3.set_left_x(editor, left_x);
+        set_editor_left_x_clamped(editor, left_x);
     }
     view->proxy_active = FALSE;
     view->syncing = FALSE;
@@ -721,7 +762,7 @@ static void apply_proxy_source(ViewState *view) {
     update_native_layout(view, FALSE);
     for (side = 0; side < MAX_EDITOR_SIDES; ++side) {
         void *editor = bc3_frame_detail_editor(view->frame, side);
-        if (editor) g_bc3.set_left_x(editor, shared_left_x);
+        if (editor) set_editor_left_x_clamped(editor, shared_left_x);
     }
     view->syncing = FALSE;
     invalidate_native_editors(view);
@@ -813,7 +854,7 @@ static void sync_detail_horizontal(ViewState *view, int source_side) {
         void *editor = bc3_frame_detail_editor(view->frame, side);
         HWND inner;
         if (!editor || editor == source_editor) continue;
-        g_bc3.set_left_x(editor, left_x);
+        set_editor_left_x_clamped(editor, left_x);
         inner = editor_inner_window(editor);
         if (inner) InvalidateRect(inner, NULL, FALSE);
     }
@@ -900,6 +941,12 @@ void multidetails_shutdown(void) {
                 IsWindow(view->detail_inner[side])) {
                 SetWindowLongPtrW(view->detail_inner[side], GWLP_WNDPROC,
                                   (LONG_PTR)view->detail_inner_original[side]);
+            }
+            if (view->detail_outer[side] &&
+                view->detail_outer_original[side] &&
+                IsWindow(view->detail_outer[side])) {
+                SetWindowLongPtrW(view->detail_outer[side], GWLP_WNDPROC,
+                                  (LONG_PTR)view->detail_outer_original[side]);
             }
         }
         if (view->message_window && IsWindow(view->message_window))
@@ -1157,6 +1204,29 @@ static LRESULT CALLBACK detail_inner_proc(HWND window, UINT message,
     if (message == WM_NCDESTROY && view && side >= 0) {
         view->detail_inner[side] = NULL;
         view->detail_inner_original[side] = NULL;
+    }
+    return result;
+}
+
+static LRESULT CALLBACK detail_outer_proc(HWND window, UINT message,
+                                          WPARAM wparam, LPARAM lparam) {
+    int side = -1;
+    ViewState *view = view_from_detail_outer(window, &side);
+    WNDPROC original = view && side >= 0
+                           ? view->detail_outer_original[side]
+                           : NULL;
+    LRESULT result = original
+                         ? CallWindowProcW(original, window, message, wparam,
+                                           lparam)
+                         : DefWindowProcW(window, message, wparam, lparam);
+    /* Run after BC3 processes the scrollbar command so get_left_x observes
+       the new position.  set_left_x then uses BC3's own full-editor scroll
+       and repaint path for every row in the other detail editor. */
+    if (view && message == WM_HSCROLL)
+        sync_detail_horizontal(view, side);
+    if (message == WM_NCDESTROY && view && side >= 0) {
+        view->detail_outer[side] = NULL;
+        view->detail_outer_original[side] = NULL;
     }
     return result;
 }
